@@ -4,7 +4,7 @@
  * Production-ready with Pino logging, Prometheus metrics, session management
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -14,6 +14,7 @@ import { SocksProxyAgent } from 'socks-proxy-agent';
 import pino from 'pino';
 import { v4 as uuidv4 } from 'uuid';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'crypto';
 
 dotenv.config();
 
@@ -230,7 +231,7 @@ app.use(express.json());
 app.use((req, res, next) => { metrics.requestCount++; next(); });
 
 const limiter = rateLimit({ windowMs: SECURITY.defaultRateLimit.windowMs, max: SECURITY.defaultRateLimit.max, message: { error: 'Rate limit exceeded' } });
-app.use('/sse', limiter); app.use('/message', limiter);
+app.use('/mcp', limiter);
 
 function authMiddleware(req, res, next) {
   if (!SECURITY.requireApiKey) return next();
@@ -250,16 +251,74 @@ app.get('/metrics', (req, res) => {
   res.type('text/plain').send(`# HELP mcp_requests_total Total requests\nmcp_requests_total ${metrics.requestCount}\n# HELP mcp_errors_total Total errors\nmcp_errors_total ${metrics.errorCount}\n# HELP mcp_websocket_connected WebSocket status\nmcp_websocket_connected ${isConnected ? 1 : 0}\n# HELP mcp_components_discovered Discovered components\nmcp_components_discovered ${Object.keys(discoveredComponents.list).length}\n# HELP mcp_sessions_active Active sessions\nmcp_sessions_active ${sessionManager.sessions.size}\n# HELP mcp_uptime_seconds Uptime\nmcp_uptime_seconds ${Math.floor((Date.now() - metrics.startTime) / 1000)}\n${toolCallsStr}`);
 });
 
-app.get('/sse', authMiddleware, async (req, res) => {
-  logger.info({ ip: req.ip }, 'SSE client connected');
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-  const transport = new SSEServerTransport('/message', res);
-  await server.connect(transport);
+// Streamable HTTP transport - session management
+const transports = new Map();
+
+// MCP endpoint using Streamable HTTP transport
+app.post('/mcp', authMiddleware, async (req, res) => {
+  logger.info({ ip: req.ip, sessionId: req.headers['mcp-session-id'] }, 'MCP request received');
+
+  const sessionId = req.headers['mcp-session-id'];
+  let transport = transports.get(sessionId);
+
+  if (!transport) {
+    // New session - create transport
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (newSessionId) => {
+        transports.set(newSessionId, transport);
+        logger.info({ sessionId: newSessionId }, 'MCP session initialized');
+      }
+    });
+
+    // Connect to MCP server
+    await server.connect(transport);
+
+    // Handle session close
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        transports.delete(transport.sessionId);
+        logger.info({ sessionId: transport.sessionId }, 'MCP session closed');
+      }
+    };
+  }
+
+  // Handle the request
+  await transport.handleRequest(req, res, req.body);
 });
 
-app.post('/message', authMiddleware, express.json(), async (req, res) => {
-  logger.debug({ body: req.body }, 'Message received');
-  res.json({ received: true });
+// GET endpoint for SSE notifications (optional, for server-initiated messages)
+app.get('/mcp', authMiddleware, async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  const transport = transports.get(sessionId);
+
+  if (!transport) {
+    return res.status(400).json({ error: 'No active session. Send POST to /mcp first.' });
+  }
+
+  // Set up SSE for server notifications
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
+  // Handle SSE connection
+  await transport.handleRequest(req, res);
+});
+
+// DELETE endpoint for session termination
+app.delete('/mcp', authMiddleware, async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  const transport = transports.get(sessionId);
+
+  if (transport) {
+    await transport.close();
+    transports.delete(sessionId);
+    logger.info({ sessionId }, 'MCP session terminated');
+  }
+
+  res.status(200).json({ success: true });
 });
 
 // Main
