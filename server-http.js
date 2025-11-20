@@ -10,6 +10,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 import { io } from 'socket.io-client';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import pino from 'pino';
 import { v4 as uuidv4 } from 'uuid';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -78,7 +79,28 @@ async function initWebSocket() {
   const url = `http://${CONFIG.websocketHost}:${CONFIG.websocketPort}`;
   return new Promise((resolve, reject) => {
     logger.info({ url }, 'Connecting to WebSocket bridge');
-    socket = io(url, { transports: ['websocket'], reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 5000, reconnectionAttempts: Infinity, pingInterval: 25000, pingTimeout: 60000, timeout: CONFIG.connectionTimeout });
+
+    // Build socket.io options
+    const socketOptions = {
+      transports: ['websocket'],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: Infinity,
+      pingInterval: 25000,
+      pingTimeout: 60000,
+      timeout: CONFIG.connectionTimeout
+    };
+
+    // Use SOCKS5 proxy when Tailscale is configured (for Render deployment)
+    if (process.env.TAILSCALE_AUTHKEY) {
+      const proxyUrl = process.env.TAILSCALE_SOCKS_PROXY || 'socks5://127.0.0.1:1055';
+      logger.info({ proxyUrl }, 'Using Tailscale SOCKS5 proxy for WebSocket connection');
+      const agent = new SocksProxyAgent(proxyUrl);
+      socketOptions.agent = agent;
+    }
+
+    socket = io(url, socketOptions);
     const timeout = setTimeout(() => reject(new Error('Connection timeout')), CONFIG.connectionTimeout);
     socket.on('connect', async () => {
       clearTimeout(timeout); isConnected = true; reconnectAttempt = 0; metrics.websocketConnections++;

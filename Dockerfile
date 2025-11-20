@@ -43,11 +43,12 @@ RUN echo '#!/bin/sh' > /app/start.sh && \
     echo '' >> /app/start.sh && \
     echo '# Start Tailscale daemon if auth key is provided' >> /app/start.sh && \
     echo 'if [ -n "$TAILSCALE_AUTHKEY" ]; then' >> /app/start.sh && \
-    echo '  echo "Starting Tailscale daemon..."' >> /app/start.sh && \
-    echo '  tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &' >> /app/start.sh && \
-    echo '  sleep 2' >> /app/start.sh && \
+    echo '  echo "Starting Tailscale daemon (userspace networking mode for Render)..."' >> /app/start.sh && \
+    echo '  tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --tun=userspace-networking --socks5-server=localhost:1055 &' >> /app/start.sh && \
+    echo '  sleep 3' >> /app/start.sh && \
     echo '  echo "Connecting to Tailscale network..."' >> /app/start.sh && \
     echo '  tailscale up --authkey=$TAILSCALE_AUTHKEY --hostname=${TAILSCALE_HOSTNAME:-bucontrol-mcp-render}' >> /app/start.sh && \
+    echo '  echo "Tailscale SOCKS5 proxy available at localhost:1055"' >> /app/start.sh && \
     echo '  echo "Tailscale connected!"' >> /app/start.sh && \
     echo '  tailscale status' >> /app/start.sh && \
     echo 'else' >> /app/start.sh && \
