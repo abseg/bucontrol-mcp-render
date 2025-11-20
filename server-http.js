@@ -88,8 +88,6 @@ async function initWebSocket() {
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
       reconnectionAttempts: Infinity,
-      pingInterval: 25000,
-      pingTimeout: 60000,
       timeout: CONFIG.connectionTimeout
     };
 
@@ -108,8 +106,42 @@ async function initWebSocket() {
       logger.info('Connected to WebSocket bridge');
       try { await identifyClient(); const d = await tryDiscoverComponents(); if (!d.success || d.componentCount === 0) { await new Promise(r => { socket.once('digitaltwin:ready', r); setTimeout(r, 30000); }); await tryDiscoverComponents(); } resolve(); } catch (e) { reject(e); }
     });
-    socket.on('disconnect', () => { isConnected = false; isIdentified = false; logger.warn('Disconnected from WebSocket'); socket.removeAllListeners('component:state'); socket.removeAllListeners('control:update'); });
+    socket.on('disconnect', (reason) => {
+      isConnected = false; isIdentified = false;
+      logger.warn({ reason }, 'Disconnected from WebSocket');
+      socket.removeAllListeners('component:state'); socket.removeAllListeners('control:update');
+    });
     socket.on('connect_error', (e) => { clearTimeout(timeout); metrics.websocketErrors++; reject(e); });
+
+    // Handle auto-reconnection - re-identify and rediscover components
+    socket.on('reconnect', async (attemptNumber) => {
+      logger.info({ attemptNumber }, 'Reconnected to WebSocket');
+      isConnected = true;
+      metrics.websocketReconnections++;
+      try {
+        await identifyClient();
+        await tryDiscoverComponents();
+        logger.info('Re-identified after reconnection');
+      } catch (e) {
+        logger.error({ error: e.message }, 'Failed to re-identify after reconnection');
+      }
+    });
+
+    // Client-side status poll to keep connection alive and get fresh data
+    setInterval(() => {
+      if (isConnected && isIdentified && socket) {
+        socket.emit('controller:subscribe', { controllerId: CONFIG.controllerId });
+        logger.debug('Status poll sent');
+      }
+    }, 25000); // Every 25 seconds
+
+    socket.on('reconnect_attempt', (attemptNumber) => {
+      logger.debug({ attemptNumber }, 'Attempting to reconnect');
+    });
+
+    socket.on('reconnect_error', (e) => {
+      logger.warn({ error: e.message }, 'Reconnection error');
+    });
     socket.on('control:update', (data) => {
       const map = { HardwareState: 'hardwareState', 'hdmi.enabled.button': 'screenPower', 'pin.8.digital.out': 'privacyGlass', 'hdmi.out.1.select.hdmi.1': 'didoOutput', ZoneDimLevel1: 'lightingLevel', 'output.1.gain': 'volumeLevel' };
       if (data.controlId === 'ConnectedSources') { try { controlState.connectedSources = JSON.parse(data.control.string || data.control.value).sources; } catch(e) {} }
@@ -329,8 +361,33 @@ async function main() {
     logger.info({ address: `${CONFIG.bindAddress}:${CONFIG.httpPort}` }, 'HTTP server listening');
   });
 
-  // Connect to WebSocket in background
-  initWebSocket().then(() => logger.info('WebSocket initialized')).catch(e => logger.error({ error: e.message }, 'WebSocket init failed'));
+  // Connect to WebSocket in background with retry logic
+  async function connectWithRetry(maxRetries = 10) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await initWebSocket();
+        logger.info('WebSocket initialized successfully');
+        return;
+      } catch (e) {
+        const delay = calculateBackoff(attempt);
+        logger.warn({ error: e.message, attempt, maxRetries, nextRetryMs: delay }, 'WebSocket init failed, retrying...');
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+    logger.error({ maxRetries }, 'WebSocket init failed after all retries - will rely on manual reconnect');
+  }
+
+  connectWithRetry();
+
+  // Periodic health check - reconnect if disconnected
+  setInterval(() => {
+    if (!isConnected && socket) {
+      logger.info('Health check: WebSocket disconnected, attempting reconnect...');
+      socket.connect();
+    }
+  }, 30000); // Check every 30 seconds
 
   // Graceful shutdown
   const shutdown = async (signal) => {
