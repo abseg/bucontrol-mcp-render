@@ -319,7 +319,14 @@ app.post('/mcp', authMiddleware, async (req, res) => {
   }
 
   // Handle the request
-  await transport.handleRequest(req, res, req.body);
+  try {
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message });
+    }
+    // Silently ignore ERR_HTTP_HEADERS_SENT - response already sent
+  }
 });
 
 // GET endpoint for SSE notifications (optional, for server-initiated messages)
@@ -331,15 +338,14 @@ app.get('/mcp', authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'No active session. Send POST to /mcp first.' });
   }
 
-  // Set up SSE for server notifications
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  });
-
-  // Handle SSE connection
-  await transport.handleRequest(req, res);
+  // Handle SSE connection - transport sets up headers
+  try {
+    await transport.handleRequest(req, res);
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 });
 
 // DELETE endpoint for session termination
