@@ -127,11 +127,14 @@ async function initWebSocket() {
       }
     });
 
-    // Client-side status poll to keep connection alive and get fresh data
+    // Client-side heartbeat and status poll to keep connection alive
     setInterval(() => {
-      if (isConnected && isIdentified && socket) {
-        socket.emit('controller:subscribe', { controllerId: CONFIG.controllerId });
-        logger.debug('Status poll sent');
+      if (isConnected && socket) {
+        socket.emit('ping', { timestamp: Date.now() });
+        if (isIdentified) {
+          socket.emit('controller:subscribe', { controllerId: CONFIG.controllerId });
+        }
+        logger.debug('Heartbeat ping sent');
       }
     }, 25000); // Every 25 seconds
 
