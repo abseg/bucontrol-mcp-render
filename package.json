@@ -1,0 +1,44 @@
+{
+  "name": "@bucontrol/mcp-server",
+  "version": "2.0.0",
+  "description": "MCP server for BUControl Video Wall - HTTP streaming edition for cloud deployment",
+  "main": "server-http.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server-http.js",
+    "start:stdio": "node index.js",
+    "start:legacy": "node server.js",
+    "dev": "node --watch server-http.js",
+    "test": "node test-server.js",
+    "health": "curl http://localhost:${PORT:-3100}/health"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "bucontrol",
+    "videowall",
+    "qsys",
+    "claude",
+    "render",
+    "streaming"
+  ],
+  "author": "BUControl",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "socket.io-client": "^4.8.1",
+    "pino": "^8.16.2",
+    "pino-pretty": "^10.2.3",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "supertest": "^6.3.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,118 @@
+# =============================================================================
+# Render.com Deployment Configuration for BUControl MCP Server
+# =============================================================================
+# This file configures the service deployment on Render.com
+#
+# To deploy:
+# 1. Connect your GitHub repo to Render
+# 2. Render will auto-detect this file
+# 3. Configure environment variables in Render dashboard
+# =============================================================================
+
+services:
+  - type: web
+    name: bucontrol-mcp-server
+    env: docker
+    region: frankfurt  # Choose region closest to your BUControl backend
+    plan: starter      # $7/month - always on, auto-scaling
+    branch: main
+
+    # Docker configuration (standalone repo - files in root)
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    # Health check configuration
+    healthCheckPath: /health
+
+    # Environment variables
+    # NOTE: Secrets should be set manually in Render dashboard
+    envVars:
+      # Server configuration
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+
+      # WebSocket backend connection
+      # Option 1: Use Tailscale (recommended)
+      - key: WEBSOCKET_HOST
+        value: 100.71.254.15
+      - key: WEBSOCKET_PORT
+        value: 3004
+      - key: CONTROLLER_ID
+        value: modular-controller-config
+
+      # Tailscale configuration (set as secrets in dashboard)
+      - key: TAILSCALE_AUTHKEY
+        sync: false  # Set manually - this is a secret
+      - key: TAILSCALE_HOSTNAME
+        value: bucontrol-mcp-render
+
+      # Security (set API_KEYS as secret in dashboard)
+      - key: API_KEYS
+        sync: false  # Set manually - these are secrets
+      - key: REQUIRE_API_KEY
+        value: "true"
+      - key: CORS_ORIGINS
+        value: "https://claude.ai,https://api.anthropic.com,*"
+
+      # Rate limiting
+      - key: RATE_LIMIT_WINDOW
+        value: "60000"
+      - key: RATE_LIMIT_MAX
+        value: "100"
+
+      # Logging and monitoring
+      - key: LOG_LEVEL
+        value: info
+      - key: ENABLE_METRICS
+        value: "true"
+
+      # Timeouts
+      - key: CONNECTION_TIMEOUT
+        value: "20000"
+      - key: COMMAND_TIMEOUT
+        value: "10000"
+
+    # Auto-deploy on push
+    autoDeploy: true
+
+    # Scaling configuration (for paid plans)
+    # scaling:
+    #   minInstances: 1
+    #   maxInstances: 3
+    #   targetMemoryPercent: 80
+    #   targetCPUPercent: 70
+
+# =============================================================================
+# Alternative: Deploy without Docker (simpler, no Tailscale)
+# =============================================================================
+# Uncomment below and comment out the Docker service above if you don't need
+# Tailscale and prefer a simpler deployment
+# =============================================================================
+
+# services:
+#   - type: web
+#     name: bucontrol-mcp-server
+#     env: node
+#     region: frankfurt
+#     plan: starter
+#     branch: main
+#     rootDir: packages/mcp-bucontrol-server
+#     buildCommand: npm install
+#     startCommand: npm start
+#     healthCheckPath: /health
+#     envVars:
+#       - key: NODE_ENV
+#         value: production
+#       # ... same env vars as above ...
+
+# =============================================================================
+# Preview Environments (optional)
+# =============================================================================
+# Uncomment to enable preview environments for pull requests
+
+# previewsEnabled: true
+# previewsExpireAfterDays: 3

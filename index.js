@@ -1,0 +1,1347 @@
+#!/usr/bin/env node
+
+/**
+ * BUControl MCP Server
+ *
+ * Enables Claude Desktop to control BUControl Video Wall via natural language.
+ * Claude generates WindowCommand strings directly - this server just handles WebSocket communication.
+ */
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+import { io } from 'socket.io-client';
+
+/**
+ * Log with timestamp
+ */
+function log(message) {
+  const timestamp = new Date().toISOString();
+  console.error(`${timestamp} ${message}`);
+}
+
+// Configuration
+const CONFIG = {
+  controllerId: 'modular-controller-config',
+  websocketPort: 3004, // WebSocket port (user confirmed)
+  hostname: '100.71.254.15' // VPN IP address (Tailscale)
+};
+
+// WebSocket state
+let socket = null;
+let isConnected = false;
+let isIdentified = false;
+
+// Component IDs (discovered from controller)
+const components = {
+  videoWall: null,          // BUControl Video Wall Controller
+  hdmiDisplay: null,         // Generic_HDMI_Display_HDMI-Display-1
+  gpio: null,                // GPIO_Out_Core-Maktabi
+  hdmiDecoder: null,         // HDMI_I/ODecoder_Core-Maktabi1
+  lighting: null,            // LutronLEAPZone
+  mixer: null                // Mixer_8x8_2
+};
+
+// Control state (updated in real-time)
+const controlState = {
+  // Video wall
+  hardwareState: null,
+  connectedSources: null,
+
+  // Screen power
+  screenPower: null,
+
+  // Privacy glass
+  privacyGlass: null,
+
+  // DIDO output selection
+  didoOutput: null,
+
+  // Lighting level
+  lightingLevel: null,
+
+  // Volume level (-100 to +10)
+  volumeLevel: null
+};
+
+// Dynamic component discovery state
+const discoveredComponents = {
+  list: {},  // componentName -> {id, name, controls}
+  watched: {} // controlId -> value
+};
+
+/**
+ * Initialize WebSocket connection
+ */
+async function initWebSocket() {
+  const url = `http://${CONFIG.hostname}:${CONFIG.websocketPort}`;
+
+  return new Promise((resolve, reject) => {
+    log(`[MCP] Connecting to ${url}...`);
+
+    socket = io(url, {
+      transports: ['websocket'],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: Infinity, // Keep trying forever
+      pingInterval: 25000, // Send ping every 25 seconds
+      pingTimeout: 60000,  // Wait 60 seconds for pong
+      timeout: 20000       // Connection timeout
+    });
+
+    const timeout = setTimeout(() => {
+      reject(new Error('Connection timeout (10s)'));
+    }, 10000);
+
+    socket.on('connect', async () => {
+      clearTimeout(timeout);
+      isConnected = true;
+      log('[MCP] Connected to WebSocket bridge');
+
+      try {
+        await identifyClient();
+
+        // Try to discover components immediately
+        // If system is already initialized, this will work
+        // If not, we'll get 0 components and wait for digitaltwin:ready
+        const initialDiscovery = await tryDiscoverComponents();
+
+        if (!initialDiscovery.success || initialDiscovery.componentCount === 0) {
+          log('[MCP] Waiting for Digital Twin initialization...');
+
+          // Wait for Digital Twin to be ready
+          await new Promise((resolveReady) => {
+            socket.once('digitaltwin:ready', async (data) => {
+              log(`[MCP] Digital Twin ready: ${data.totalComponents} components, ${data.totalControls} controls`);
+              resolveReady();
+            });
+
+            // Timeout after 30 seconds
+            setTimeout(() => {
+              log('[MCP] Timeout waiting for digitaltwin:ready, proceeding with what we have');
+              resolveReady();
+            }, 30000);
+          });
+
+          // Try discovery again after digitaltwin:ready
+          await tryDiscoverComponents();
+        }
+
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    socket.on('disconnect', () => {
+      isConnected = false;
+      isIdentified = false;
+      log('[MCP] Disconnected from WebSocket bridge');
+
+      // Clean up all event listeners to prevent accumulation on reconnect
+      socket.removeAllListeners('component:state');
+      socket.removeAllListeners('control:update');
+      socket.removeAllListeners('client:identify:success');
+      socket.removeAllListeners('controller:state');
+      socket.removeAllListeners('control:set:success');
+      socket.removeAllListeners('control:set:error');
+    });
+
+    socket.on('connect_error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+
+    socket.on('error', (data) => {
+      log('[MCP] Server error:', data.message);
+    });
+
+    // Listen for control updates
+    socket.on('control:update', (data) => {
+      // Video wall controls
+      if (data.controlId === 'HardwareState') {
+        controlState.hardwareState = data.control.string || data.control.value;
+        log('[MCP] HardwareState updated');
+      }
+      if (data.controlId === 'ConnectedSources') {
+        try {
+          const sourcesStr = data.control.string || data.control.value;
+          const parsed = JSON.parse(sourcesStr);
+          controlState.connectedSources = parsed.sources || parsed;
+          log('[MCP] ConnectedSources updated');
+        } catch (e) {
+          log('[MCP] Failed to parse ConnectedSources:', e.message);
+        }
+      }
+
+      // Screen power
+      if (data.controlId === 'hdmi.enabled.button') {
+        controlState.screenPower = data.control.value;
+        log('[MCP] Screen power updated:', data.control.value);
+      }
+
+      // Privacy glass
+      if (data.controlId === 'pin.8.digital.out') {
+        controlState.privacyGlass = data.control.value;
+        log('[MCP] Privacy glass updated:', data.control.value);
+      }
+
+      // DIDO output selection
+      if (data.controlId === 'hdmi.out.1.select.hdmi.1') {
+        controlState.didoOutput = data.control.value;
+        log('[MCP] DIDO output updated:', data.control.value);
+      }
+
+      // Lighting level
+      if (data.controlId === 'ZoneDimLevel1') {
+        controlState.lightingLevel = data.control.value;
+        log('[MCP] Lighting level updated:', data.control.value);
+      }
+
+      // Volume level
+      if (data.controlId === 'output.1.gain') {
+        controlState.volumeLevel = data.control.value;
+        log('[MCP] Volume level updated:', data.control.value);
+      }
+    });
+  });
+}
+
+/**
+ * Identify client with WebSocket bridge
+ */
+function identifyClient() {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Identification timeout (5s)'));
+    }, 5000);
+
+    socket.once('client:identify:success', (data) => {
+      clearTimeout(timeout);
+      isIdentified = true;
+      log('[MCP] Client identified:', data.clientId);
+      resolve(data);
+    });
+
+    socket.emit('client:identify', {
+      platform: 'desktop',
+      device: 'claude-mcp',
+      osVersion: process.platform,
+      appVersion: '1.0.0',
+      buildNumber: '1',
+      deviceName: 'Claude Desktop MCP Server'
+    });
+  });
+}
+
+/**
+ * Discover all BUControl components
+ */
+function tryDiscoverComponents() {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      log('[MCP] Component discovery timeout (10s)');
+      resolve({ success: false, componentCount: 0 });
+    }, 10000);
+
+    socket.once('controller:state', (data) => {
+      clearTimeout(timeout);
+
+      if (!data.components) {
+        log('[MCP] No components in controller state');
+        resolve({ success: false, componentCount: 0 });
+        return;
+      }
+
+      // Components are keyed by ID, we need to search by name
+      const componentEntries = Object.entries(data.components);
+      log(`[MCP] Discovering ${componentEntries.length} components...`);
+
+      // Store ALL components for generic access
+      for (const [compId, comp] of componentEntries) {
+        discoveredComponents.list[comp.name] = {
+          id: compId,
+          name: comp.name,
+          controls: comp.controls || {}
+        };
+      }
+
+      // Find video wall controller
+      const videoController = componentEntries.find(([id, comp]) =>
+        comp.name.includes('BUControl') ||
+        comp.name.includes('Video Wall') ||
+        comp.name.includes('VideoWall') ||
+        (comp.name.includes('Wall') && comp.name.includes('Controller'))
+      );
+      if (videoController) {
+        components.videoWall = videoController[0]; // Use the ID
+        log(`[MCP] Found video wall: ${videoController[1].name} (${components.videoWall})`);
+      }
+
+      // Find HDMI display
+      const hdmiDisplay = componentEntries.find(([id, comp]) =>
+        comp.name.includes('Generic_HDMI_Display') ||
+        comp.name.includes('HDMI-Display')
+      );
+      if (hdmiDisplay) {
+        components.hdmiDisplay = hdmiDisplay[0];
+        log(`[MCP] Found HDMI display: ${hdmiDisplay[1].name} (${components.hdmiDisplay})`);
+      }
+
+      // Find GPIO
+      const gpio = componentEntries.find(([id, comp]) =>
+        comp.name.includes('GPIO_Out_Core-Maktabi') ||
+        (comp.name.includes('GPIO') && comp.name.includes('Maktabi'))
+      );
+      if (gpio) {
+        components.gpio = gpio[0];
+        log(`[MCP] Found GPIO: ${gpio[1].name} (${components.gpio})`);
+      }
+
+      // Find HDMI decoder
+      const hdmiDecoder = componentEntries.find(([id, comp]) =>
+        comp.name.includes('HDMI_I/ODecoder_Core-Maktabi') ||
+        (comp.name.includes('HDMI') && comp.name.includes('Decoder') && comp.name.includes('Maktabi'))
+      );
+      if (hdmiDecoder) {
+        components.hdmiDecoder = hdmiDecoder[0];
+        log(`[MCP] Found HDMI decoder: ${hdmiDecoder[1].name} (${components.hdmiDecoder})`);
+      }
+
+      // Find Lutron lighting
+      const lighting = componentEntries.find(([id, comp]) =>
+        comp.name.includes('LutronLEAPZone') ||
+        (comp.name.includes('Lutron') && comp.name.includes('Zone'))
+      );
+      if (lighting) {
+        components.lighting = lighting[0];
+        log(`[MCP] Found lighting: ${lighting[1].name} (${components.lighting})`);
+      }
+
+      // Find Mixer
+      const mixer = componentEntries.find(([id, comp]) =>
+        comp.name.includes('Mixer_8x8_2') ||
+        (comp.name.includes('Mixer') && comp.name.includes('8x8'))
+      );
+      if (mixer) {
+        components.mixer = mixer[0];
+        log(`[MCP] Found mixer: ${mixer[1].name} (${components.mixer})`);
+      }
+
+      // Watch all discovered components
+      watchComponents();
+      resolve({ success: true, componentCount: componentEntries.length });
+    });
+
+    socket.emit('controller:subscribe', {
+      controllerId: CONFIG.controllerId
+    });
+  });
+}
+
+/**
+ * Watch all components for state updates
+ */
+function watchComponents() {
+  // Remove any existing component:state listeners to prevent duplicates
+  socket.removeAllListeners('component:state');
+
+  // Track how many component:state events we expect
+  let expectedEvents = Object.values(components).filter(id => id !== null).length;
+  let receivedEvents = 0;
+
+  socket.on('component:state', (data) => {
+    receivedEvents++;
+    log(`[MCP] Subscribed to component: ${data.componentId} (${receivedEvents}/${expectedEvents})`);
+
+    // Store initial states from all components
+    const controls = data.component.controls;
+    if (!controls) return;
+
+    // Video wall controls
+    if (controls.HardwareState) {
+      controlState.hardwareState = controls.HardwareState.string || controls.HardwareState.value;
+    }
+    if (controls.ConnectedSources) {
+      try {
+        const sourcesStr = controls.ConnectedSources.string || controls.ConnectedSources.value;
+        const parsed = JSON.parse(sourcesStr);
+        controlState.connectedSources = parsed.sources || parsed;
+      } catch (e) {
+        log('[MCP] Failed to parse initial ConnectedSources');
+      }
+    }
+
+    // Screen power
+    if (controls['hdmi.enabled.button']) {
+      controlState.screenPower = controls['hdmi.enabled.button'].value;
+    }
+
+    // Privacy glass
+    if (controls['pin.8.digital.out']) {
+      controlState.privacyGlass = controls['pin.8.digital.out'].value;
+    }
+
+    // DIDO output
+    if (controls['hdmi.out.1.select.hdmi.1']) {
+      controlState.didoOutput = controls['hdmi.out.1.select.hdmi.1'].value;
+    }
+
+    // Lighting level
+    if (controls.ZoneDimLevel1) {
+      controlState.lightingLevel = controls.ZoneDimLevel1.value;
+    }
+
+    // Volume level
+    if (controls['output.1.gain']) {
+      controlState.volumeLevel = controls['output.1.gain'].value;
+    }
+  });
+
+  // Watch all discovered components
+  if (components.videoWall) {
+    socket.emit('component:watch', {
+      controllerId: CONFIG.controllerId,
+      componentId: components.videoWall
+    });
+  }
+
+  if (components.hdmiDisplay) {
+    socket.emit('component:watch', {
+      controllerId: CONFIG.controllerId,
+      componentId: components.hdmiDisplay
+    });
+  }
+
+  if (components.gpio) {
+    socket.emit('component:watch', {
+      controllerId: CONFIG.controllerId,
+      componentId: components.gpio
+    });
+  }
+
+  if (components.hdmiDecoder) {
+    socket.emit('component:watch', {
+      controllerId: CONFIG.controllerId,
+      componentId: components.hdmiDecoder
+    });
+  }
+
+  if (components.lighting) {
+    socket.emit('component:watch', {
+      controllerId: CONFIG.controllerId,
+      componentId: components.lighting
+    });
+  }
+
+  if (components.mixer) {
+    socket.emit('component:watch', {
+      controllerId: CONFIG.controllerId,
+      componentId: components.mixer
+    });
+  }
+}
+
+/**
+ * Generic function to send control value to any component
+ */
+function sendControl(componentId, controlId, value) {
+  return new Promise((resolve, reject) => {
+    if (!isConnected || !isIdentified) {
+      reject(new Error('Not connected to WebSocket bridge'));
+      return;
+    }
+
+    if (!componentId) {
+      reject(new Error('Component not found'));
+      return;
+    }
+
+    const transactionId = `mcp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const timeout = setTimeout(() => {
+      reject(new Error('Command timeout (10s)'));
+    }, 10000);
+
+    const successHandler = (data) => {
+      if (data.transactionId === transactionId) {
+        clearTimeout(timeout);
+        socket.off('control:set:success', successHandler);
+        socket.off('control:set:error', errorHandler);
+        resolve({
+          success: true,
+          message: 'Command sent successfully',
+          transactionId: data.transactionId
+        });
+      }
+    };
+
+    const errorHandler = (data) => {
+      if (data.transactionId === transactionId) {
+        clearTimeout(timeout);
+        socket.off('control:set:success', successHandler);
+        socket.off('control:set:error', errorHandler);
+        reject(new Error(data.message || 'Command failed'));
+      }
+    };
+
+    socket.on('control:set:success', successHandler);
+    socket.on('control:set:error', errorHandler);
+
+    socket.emit('control:set', {
+      controllerId: CONFIG.controllerId,
+      componentId: componentId,
+      controlId: controlId,
+      value: value,
+      transactionId: transactionId
+    });
+  });
+}
+
+/**
+ * Send WindowCommand to video wall
+ */
+function sendWindowCommand(command) {
+  return sendControl(components.videoWall, 'WindowCommand', command);
+}
+
+/**
+ * Find component by partial name match (case-insensitive)
+ */
+function findComponent(partialName) {
+  const match = Object.keys(discoveredComponents.list).find(name =>
+    name.toLowerCase().includes(partialName.toLowerCase())
+  );
+  return match ? discoveredComponents.list[match] : null;
+}
+
+/**
+ * Create and configure MCP server
+ */
+const server = new Server(
+  {
+    name: 'bucontrol',
+    version: '1.0.0',
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  }
+);
+
+/**
+ * List available tools
+ */
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: [
+      {
+        name: 'send_videowall_command',
+        description: `Send WindowCommand to BUControl Video Wall.
+
+WindowCommand Protocol Format:
+BV<version>:<flags>:<audio>:<count>:<window1>:<window2>:...[:<windowN>]
+
+Components:
+- BV<version>: Protocol identifier (always "BV1")
+- <flags>: E=enabled, D=disabled
+- <audio>: Audio output - A1, A2, A3, or A4 (maps to IN1-IN4)
+- <count>: Number of windows (1-4)
+- <windowN>: W<id>S<src>X<x>Y<y>W<w>H<h>A<a>
+
+Window Parameters:
+- W<id>: Window ID (1-4, determines z-order, 1=bottom)
+- S<src>: Source input (1-4 = IN1-IN4)
+- X<x>: X position (0-100, percentage)
+- Y<y>: Y position (0-100, percentage)
+- W<w>: Width (1-100, percentage)
+- H<h>: Height (1-100, percentage)
+- A<a>: Alpha transparency (0-100, 0=opaque, 100=transparent)
+
+CRITICAL RULES:
+- Window 1 alpha MUST be 0 (opaque bottom layer)
+- Geometry must not overflow: X+W ≤ 100, Y+H ≤ 100
+- All values are integers
+
+Examples:
+- Fullscreen IN1: "BV1:E:A1:1:W1S1X0Y0W100H100A0"
+- IN1 with IN3 overlay (60% transparent): "BV1:E:A1:2:W1S1X0Y0W100H100A0:W2S3X0Y0W100H100A60"
+- Side-by-side IN2/IN3: "BV1:E:A2:2:W1S2X0Y0W50H100A0:W2S3X50Y0W50H100A0"
+- PIP (IN2 main, IN3 corner): "BV1:E:A2:2:W1S2X0Y0W100H100A0:W2S3X70Y70W25H25A0"`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            command: {
+              type: 'string',
+              description: 'WindowCommand string in compact text format (e.g., "BV1:E:A1:2:W1S1X0Y0W100H100A0:W2S3X0Y0W100H100A60")'
+            }
+          },
+          required: ['command']
+        }
+      },
+      {
+        name: 'get_videowall_status',
+        description: `Get current video wall hardware state.
+
+Returns the current display configuration from the Aurora DIDO hardware, including:
+- Windowing enabled/disabled status
+- Active windows with their geometry and alpha
+- Current source routing (which inputs are displayed)
+- Audio routing
+
+The hardware state is polled every 1 second from the DIDO device.`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'list_video_sources',
+        description: `List available video sources and their connection status.
+
+Returns information about all 4 video inputs (IN1-IN4):
+- Connection status (connected/disconnected)
+- Source name/label
+- VPX encoder IP address
+- Signal presence
+
+Sources are polled every 30 seconds via VPX heartbeat.`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'set_screen_power',
+        description: `Turn the HDMI display screen on or off.
+
+Controls the Generic_HDMI_Display power state.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            enabled: {
+              type: 'boolean',
+              description: 'true to turn screen on, false to turn screen off'
+            }
+          },
+          required: ['enabled']
+        }
+      },
+      {
+        name: 'get_screen_power',
+        description: `Get the current HDMI display screen power state.
+
+Returns whether the screen is on or off.`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'set_privacy_glass',
+        description: `Control the privacy glass frosting.
+
+Controls GPIO-8 Digital Output to frost or clear the privacy glass.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            frosted: {
+              type: 'boolean',
+              description: 'true to frost the glass (private), false to clear the glass (transparent)'
+            }
+          },
+          required: ['frosted']
+        }
+      },
+      {
+        name: 'get_privacy_glass',
+        description: `Get the current privacy glass state.
+
+Returns whether the glass is frosted (private) or clear (transparent).`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'set_dido_output',
+        description: `Enable or disable DIDO output on the video wall.
+
+Controls HDMI Output 1 Select HDMI 1. This must be enabled to see the video wall display.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            enabled: {
+              type: 'boolean',
+              description: 'true to enable DIDO output (show video wall), false to disable'
+            }
+          },
+          required: ['enabled']
+        }
+      },
+      {
+        name: 'get_dido_output',
+        description: `Get the current DIDO output state.
+
+Returns whether DIDO output is enabled or disabled.`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'set_lighting_level',
+        description: `Set the room lighting level.
+
+Controls Lutron LEAP Zone 1 dim level (0-100).
+
+Examples:
+- Bright/full: 100
+- Normal: 75
+- Dim: 40-50
+- Very dim: 20-30
+- Off: 0`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            level: {
+              type: 'number',
+              description: 'Lighting level from 0 (off) to 100 (full brightness)'
+            }
+          },
+          required: ['level']
+        }
+      },
+      {
+        name: 'get_lighting_level',
+        description: `Get the current room lighting level.
+
+Returns the current Lutron LEAP Zone 1 dim level (0-100).`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'set_volume',
+        description: `Set the main audio output volume level.
+
+Controls Mixer_8x8_2 Output 1 Gain (-100 to +10 dB).
+
+Examples:
+- Maximum: +10 dB
+- Normal/comfortable: 0 dB
+- Quiet: -20 dB
+- Very quiet: -40 dB
+- Minimum: -100 dB (essentially muted)`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            level: {
+              type: 'number',
+              description: 'Volume level in dB from -100 (minimum) to +10 (maximum)'
+            }
+          },
+          required: ['level']
+        }
+      },
+      {
+        name: 'get_volume',
+        description: `Get the current main audio output volume level.
+
+Returns the current Mixer_8x8_2 Output 1 Gain level in dB (-100 to +10).`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'list_components',
+        description: `List all available components in the Q-SYS controller.
+
+Returns a list of all discovered components with their:
+- Component ID
+- Component name
+- Component type (if available)
+
+This is useful for discovering what components are available before trying to control them.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            filter: {
+              type: 'string',
+              description: 'Optional: Filter components by name (case-insensitive partial match)'
+            }
+          }
+        }
+      },
+      {
+        name: 'get_component_details',
+        description: `Get detailed information about a specific component.
+
+Returns:
+- Component ID and name
+- List of all controls with their:
+  - Control ID
+  - Current value
+  - Control type (if available)
+
+Use list_components first to find the component name or ID you want to inspect.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            componentName: {
+              type: 'string',
+              description: 'Component name (e.g., "LutronLEAPZone", "Mixer_8x8_2") - partial match supported'
+            }
+          },
+          required: ['componentName']
+        }
+      },
+      {
+        name: 'watch_control',
+        description: `Watch a specific control for real-time updates.
+
+After calling this, the control's value will be tracked and available via get_control_value.
+
+Example: Watch the boardroom lighting level:
+1. Use list_components to find lighting component
+2. Use get_component_details to find the control ID
+3. Use watch_control to start tracking it`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            componentName: {
+              type: 'string',
+              description: 'Component name (partial match supported)'
+            },
+            controlId: {
+              type: 'string',
+              description: 'Control ID to watch (e.g., "ZoneDimLevel1", "output.1.gain")'
+            }
+          },
+          required: ['componentName', 'controlId']
+        }
+      },
+      {
+        name: 'set_control_generic',
+        description: `Set any control value on any component.
+
+Generic control setter that works with any Q-SYS component.
+
+Steps:
+1. Use list_components to find the component
+2. Use get_component_details to find available controls
+3. Use this tool to set the control value
+
+Examples:
+- Set a dimmer: {"componentName": "LutronLEAPZone", "controlId": "ZoneDimLevel1", "value": 75}
+- Mute audio: {"componentName": "Mixer_8x8_2", "controlId": "output.1.mute", "value": 1}`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            componentName: {
+              type: 'string',
+              description: 'Component name (partial match supported)'
+            },
+            controlId: {
+              type: 'string',
+              description: 'Control ID to set'
+            },
+            value: {
+              description: 'Value to set (number, boolean, or string depending on control type)'
+            }
+          },
+          required: ['componentName', 'controlId', 'value']
+        }
+      },
+      {
+        name: 'get_connection_status',
+        description: `Get the current WebSocket bridge connection status.
+
+Returns:
+- Connected: true/false
+- Identified: true/false
+- Discovered components count
+- URL and port information`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'reconnect',
+        description: `Force a reconnection to the WebSocket bridge.
+
+Useful if the connection is stuck or needs to be refreshed.
+Will disconnect (if connected) and reconnect, rediscovering all components.`,
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      }
+    ]
+  };
+});
+
+/**
+ * Handle tool calls
+ */
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
+    switch (name) {
+      case 'send_videowall_command': {
+        if (!args.command) {
+          throw new Error('command parameter is required');
+        }
+
+        const result = await sendWindowCommand(args.command);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_videowall_status': {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: controlState.hardwareState !== null ? 'success' : 'unknown',
+                hardwareState: controlState.hardwareState
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'list_video_sources': {
+        if (!controlState.connectedSources) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'unknown',
+                  message: 'Connected sources not yet received'
+                }, null, 2)
+              }
+            ]
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                sources: controlState.connectedSources
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      // Screen power controls
+      case 'set_screen_power': {
+        const value = args.enabled ? 1 : 0;
+        const result = await sendControl(components.hdmiDisplay, 'hdmi.enabled.button', value);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_screen_power': {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                enabled: controlState.screenPower === 1,
+                rawValue: controlState.screenPower
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      // Privacy glass controls
+      case 'set_privacy_glass': {
+        const value = args.frosted ? 1 : 0;
+        const result = await sendControl(components.gpio, 'pin.8.digital.out', value);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_privacy_glass': {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                frosted: controlState.privacyGlass === 1,
+                rawValue: controlState.privacyGlass
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      // DIDO output selection
+      case 'set_dido_output': {
+        const value = args.enabled ? 1 : 0;
+        const result = await sendControl(components.hdmiDecoder, 'hdmi.out.1.select.hdmi.1', value);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_dido_output': {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                enabled: controlState.didoOutput === 1,
+                rawValue: controlState.didoOutput
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      // Lighting controls
+      case 'set_lighting_level': {
+        if (args.level === undefined) {
+          throw new Error('level parameter is required (0-100)');
+        }
+        const level = Math.max(0, Math.min(100, args.level));
+        const result = await sendControl(components.lighting, 'ZoneDimLevel1', level);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_lighting_level': {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                level: controlState.lightingLevel
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      // Volume controls
+      case 'set_volume': {
+        if (args.level === undefined) {
+          throw new Error('level parameter is required (-100 to +10)');
+        }
+        const level = Math.max(-100, Math.min(10, args.level));
+        const result = await sendControl(components.mixer, 'output.1.gain', level);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_volume': {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                level: controlState.volumeLevel,
+                unit: 'dB'
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      // Generic component discovery and control
+      case 'list_components': {
+        let components = Object.values(discoveredComponents.list);
+
+        // Apply filter if provided
+        if (args.filter) {
+          const filterLower = args.filter.toLowerCase();
+          components = components.filter(comp =>
+            comp.name.toLowerCase().includes(filterLower)
+          );
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                count: components.length,
+                components: components.map(comp => ({
+                  id: comp.id,
+                  name: comp.name,
+                  controlCount: Object.keys(comp.controls).length
+                }))
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_component_details': {
+        if (!args.componentName) {
+          throw new Error('componentName parameter is required');
+        }
+
+        const component = findComponent(args.componentName);
+        if (!component) {
+          throw new Error(`Component not found: ${args.componentName}`);
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                component: {
+                  id: component.id,
+                  name: component.name,
+                  controls: component.controls
+                }
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'watch_control': {
+        if (!args.componentName || !args.controlId) {
+          throw new Error('componentName and controlId parameters are required');
+        }
+
+        const component = findComponent(args.componentName);
+        if (!component) {
+          throw new Error(`Component not found: ${args.componentName}`);
+        }
+
+        // Subscribe to component if not already watching
+        socket.emit('component:watch', {
+          controllerId: CONFIG.controllerId,
+          componentId: component.id
+        });
+
+        // Set up dynamic control update listener
+        const watchKey = `${component.name}:${args.controlId}`;
+        socket.on('control:update', (data) => {
+          if (data.controlId === args.controlId) {
+            discoveredComponents.watched[watchKey] = data.control.value;
+            log(`[MCP] Watched control updated: ${watchKey} = ${data.control.value}`);
+          }
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                message: `Now watching ${component.name}:${args.controlId}`,
+                component: component.name,
+                controlId: args.controlId,
+                currentValue: component.controls[args.controlId]?.value
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'set_control_generic': {
+        if (!args.componentName || !args.controlId || args.value === undefined) {
+          throw new Error('componentName, controlId, and value parameters are required');
+        }
+
+        const component = findComponent(args.componentName);
+        if (!component) {
+          throw new Error(`Component not found: ${args.componentName}`);
+        }
+
+        const result = await sendControl(component.id, args.controlId, args.value);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                ...result,
+                component: component.name,
+                controlId: args.controlId,
+                value: args.value
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_connection_status': {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                connection: {
+                  connected: isConnected,
+                  identified: isIdentified,
+                  url: `http://${CONFIG.hostname}:${CONFIG.websocketPort}`,
+                  hostname: CONFIG.hostname,
+                  port: CONFIG.websocketPort,
+                  controllerId: CONFIG.controllerId
+                },
+                discovery: {
+                  componentsDiscovered: Object.keys(discoveredComponents.list).length,
+                  watchedControls: Object.keys(discoveredComponents.watched).length
+                }
+              }, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'reconnect': {
+        if (socket) {
+          log('[MCP] Forcing reconnection...');
+
+          // Disconnect existing socket
+          socket.disconnect();
+
+          // Clear state
+          isConnected = false;
+          isIdentified = false;
+          discoveredComponents.list = {};
+          discoveredComponents.watched = {};
+
+          // Reinitialize
+          try {
+            await initWebSocket();
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    status: 'success',
+                    message: 'Reconnected successfully',
+                    componentsDiscovered: Object.keys(discoveredComponents.list).length
+                  }, null, 2)
+                }
+              ]
+            };
+          } catch (error) {
+            throw new Error(`Reconnection failed: ${error.message}`);
+          }
+        } else {
+          throw new Error('No active connection to reconnect');
+        }
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: error.message
+          }, null, 2)
+        }
+      ],
+      isError: true
+    };
+  }
+});
+
+/**
+ * Main entry point
+ */
+async function main() {
+  log('[MCP] BUControl MCP Server starting...');
+
+  try {
+    // Start MCP server IMMEDIATELY so Claude Desktop gets a response
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    log('[MCP] MCP server started on stdio');
+
+    // Initialize WebSocket connection in background
+    initWebSocket()
+      .then(() => {
+        log('[MCP] WebSocket initialized successfully');
+        log('[MCP] Server fully ready');
+      })
+      .catch((error) => {
+        log('[MCP] WebSocket initialization failed:', error.message);
+        log('[MCP] Server running but tools will not work until WebSocket connects');
+      });
+  } catch (error) {
+    log('[MCP] Initialization failed:', error.message);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  log('[MCP] Shutting down...');
+  if (socket) {
+    socket.disconnect();
+  }
+  process.exit(0);
+});
+
+main();
