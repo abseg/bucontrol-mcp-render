@@ -9,6 +9,11 @@ Complete guide for deploying the BUControl MCP Server to Render.com with Tailsca
 3. **Tailscale Account**: For connecting to your local BUControl backend
 4. **API Keys**: Generate secure API keys for authentication
 
+
+S9dVhUxLSV9/fhWdyI6Ngp3TKEf1ZleDczEMWp/ebWk=
+
+
+
 ## Quick Start
 
 ### 1. Generate API Keys
