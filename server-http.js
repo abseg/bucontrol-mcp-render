@@ -15,6 +15,8 @@ import pino from 'pino';
 import { v4 as uuidv4 } from 'uuid';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { randomUUID } from 'crypto';
+import jwt from 'jsonwebtoken';
+import jwksRsa from 'jwks-rsa';
 
 dotenv.config();
 
@@ -42,11 +44,81 @@ const CONFIG = {
 
 const SECURITY = {
   apiKeys: new Map(),
+  oauthClients: new Map(),
   requireApiKey: process.env.REQUIRE_API_KEY !== 'false',
   corsOrigins: process.env.CORS_ORIGINS || '*',
   rateLimitTiers: { free: { windowMs: 60000, max: 30 }, basic: { windowMs: 60000, max: 100 }, premium: { windowMs: 60000, max: 500 }, unlimited: { windowMs: 60000, max: 10000 } },
-  defaultRateLimit: { windowMs: parseInt(process.env.RATE_LIMIT_WINDOW || '60000'), max: parseInt(process.env.RATE_LIMIT_MAX || '100') }
+  defaultRateLimit: { windowMs: parseInt(process.env.RATE_LIMIT_WINDOW || '60000'), max: parseInt(process.env.RATE_LIMIT_MAX || '100') },
+  oauth: {
+    enabled: process.env.OAUTH_ENABLED === 'true',
+    jwksUri: process.env.OAUTH_JWKS_URI || '',
+    issuer: process.env.OAUTH_ISSUER || '',
+    audience: process.env.OAUTH_AUDIENCE || '',
+    secret: process.env.OAUTH_SECRET || '',
+    algorithms: (process.env.OAUTH_ALGORITHMS || 'RS256').split(','),
+    tokenExpiry: process.env.OAUTH_TOKEN_EXPIRY || '24h'
+  }
 };
+
+// Parse OAuth clients (format: clientId:clientSecret:tier)
+(process.env.OAUTH_CLIENTS || '').split(',').filter(c => c.length > 0).forEach(entry => {
+  const [clientId, clientSecret, tier] = entry.split(':');
+  if (clientId && clientSecret) {
+    SECURITY.oauthClients.set(clientId.trim(), { secret: clientSecret.trim(), tier: tier?.trim() || 'basic' });
+  }
+});
+
+// Initialize JWKS client for OAuth token validation
+let jwksClient = null;
+if (SECURITY.oauth.enabled && SECURITY.oauth.jwksUri) {
+  jwksClient = jwksRsa({
+    jwksUri: SECURITY.oauth.jwksUri,
+    cache: true,
+    cacheMaxAge: 600000,
+    rateLimit: true,
+    jwksRequestsPerMinute: 10
+  });
+  logger.info({ jwksUri: SECURITY.oauth.jwksUri }, 'OAuth JWKS client initialized');
+}
+
+// Helper to get signing key from JWKS
+function getSigningKey(header, callback) {
+  if (!jwksClient) {
+    return callback(new Error('JWKS client not configured'));
+  }
+  jwksClient.getSigningKey(header.kid, (err, key) => {
+    if (err) return callback(err);
+    const signingKey = key.getPublicKey();
+    callback(null, signingKey);
+  });
+}
+
+// Validate OAuth Bearer token
+async function validateOAuthToken(token) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      algorithms: SECURITY.oauth.algorithms
+    };
+
+    if (SECURITY.oauth.issuer) options.issuer = SECURITY.oauth.issuer;
+    if (SECURITY.oauth.audience) options.audience = SECURITY.oauth.audience;
+
+    // Use JWKS or secret for verification
+    if (jwksClient) {
+      jwt.verify(token, getSigningKey, options, (err, decoded) => {
+        if (err) return reject(err);
+        resolve(decoded);
+      });
+    } else if (SECURITY.oauth.secret) {
+      jwt.verify(token, SECURITY.oauth.secret, options, (err, decoded) => {
+        if (err) return reject(err);
+        resolve(decoded);
+      });
+    } else {
+      reject(new Error('No OAuth verification method configured'));
+    }
+  });
+}
 
 (process.env.API_KEYS || '').split(',').filter(k => k.length > 0).forEach(entry => {
   const [key, tier] = entry.split(':');
@@ -268,14 +340,97 @@ app.use((req, res, next) => { metrics.requestCount++; next(); });
 const limiter = rateLimit({ windowMs: SECURITY.defaultRateLimit.windowMs, max: SECURITY.defaultRateLimit.max, message: { error: 'Rate limit exceeded' } });
 app.use('/mcp', limiter);
 
-function authMiddleware(req, res, next) {
+async function authMiddleware(req, res, next) {
+  if (!SECURITY.requireApiKey && !SECURITY.oauth.enabled) return next();
+
+  // Check for OAuth Bearer token first
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    if (!SECURITY.oauth.enabled) {
+      return res.status(401).json({ error: 'OAuth not enabled' });
+    }
+
+    const token = authHeader.substring(7);
+    try {
+      const decoded = await validateOAuthToken(token);
+      req.auth = {
+        type: 'oauth',
+        user: decoded,
+        tier: decoded.tier || decoded.scope?.includes('premium') ? 'premium' : 'basic'
+      };
+      logger.debug({ sub: decoded.sub }, 'OAuth token validated');
+      return next();
+    } catch (err) {
+      metrics.errorCount++;
+      logger.warn({ error: err.message }, 'OAuth token validation failed');
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+  }
+
+  // Fall back to API key authentication
   if (!SECURITY.requireApiKey) return next();
+
   const key = req.headers['x-api-key'] || req.query.apiKey;
-  if (!key) return res.status(401).json({ error: 'API key required' });
-  if (!SECURITY.apiKeys.has(key)) { metrics.errorCount++; return res.status(403).json({ error: 'Invalid API key' }); }
-  req.apiKeyTier = SECURITY.apiKeys.get(key);
+  if (!key) {
+    return res.status(401).json({
+      error: 'Authentication required',
+      methods: SECURITY.oauth.enabled
+        ? ['Authorization: Bearer <token>', 'x-api-key: <key>']
+        : ['x-api-key: <key>']
+    });
+  }
+
+  if (!SECURITY.apiKeys.has(key)) {
+    metrics.errorCount++;
+    return res.status(403).json({ error: 'Invalid API key' });
+  }
+
+  req.auth = {
+    type: 'apikey',
+    tier: SECURITY.apiKeys.get(key)
+  };
+  req.apiKeyTier = req.auth.tier;
   next();
 }
+
+// OAuth token endpoint for client credentials flow
+app.post('/oauth/token', (req, res) => {
+  if (!SECURITY.oauth.enabled) {
+    return res.status(400).json({ error: 'oauth_disabled', error_description: 'OAuth is not enabled' });
+  }
+
+  const { grant_type, client_id, client_secret } = req.body;
+
+  if (grant_type !== 'client_credentials') {
+    return res.status(400).json({ error: 'unsupported_grant_type', error_description: 'Only client_credentials grant type is supported' });
+  }
+
+  if (!client_id || !client_secret) {
+    return res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret are required' });
+  }
+
+  const client = SECURITY.oauthClients.get(client_id);
+  if (!client || client.secret !== client_secret) {
+    metrics.errorCount++;
+    logger.warn({ client_id }, 'Invalid OAuth client credentials');
+    return res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client credentials' });
+  }
+
+  // Generate access token
+  const token = jwt.sign(
+    { sub: client_id, tier: client.tier, type: 'access_token' },
+    SECURITY.oauth.secret,
+    { algorithm: 'HS256', expiresIn: SECURITY.oauth.tokenExpiry }
+  );
+
+  logger.info({ client_id, tier: client.tier }, 'OAuth token issued');
+
+  res.json({
+    access_token: token,
+    token_type: 'Bearer',
+    expires_in: 86400
+  });
+});
 
 app.get('/health', (req, res) => res.json({ status: isConnected && isIdentified ? 'healthy' : 'degraded', websocket: { connected: isConnected, identified: isIdentified }, components: Object.keys(discoveredComponents.list).length, uptime: Math.floor((Date.now() - metrics.startTime) / 1000) }));
 app.get('/ready', (req, res) => isConnected && isIdentified ? res.json({ ready: true }) : res.status(503).json({ ready: false }));
