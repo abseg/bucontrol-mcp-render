@@ -338,6 +338,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const app = express();
 app.use(cors({ origin: SECURITY.corsOrigins === '*' ? true : SECURITY.corsOrigins.split(','), credentials: true }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => { metrics.requestCount++; next(); });
 
 const limiter = rateLimit({ windowMs: SECURITY.defaultRateLimit.windowMs, max: SECURITY.defaultRateLimit.max, message: { error: 'Rate limit exceeded' } });
@@ -396,6 +397,21 @@ async function authMiddleware(req, res, next) {
   next();
 }
 
+// OAuth 2.0 Authorization Server Metadata (RFC 8414)
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  res.json({
+    issuer: baseUrl,
+    authorization_endpoint: `${baseUrl}/authorize`,
+    token_endpoint: `${baseUrl}/oauth/token`,
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
+    grant_types_supported: ['authorization_code', 'client_credentials'],
+    response_types_supported: ['code'],
+    code_challenge_methods_supported: ['S256'],
+    scopes_supported: ['claudeai']
+  });
+});
+
 // OAuth authorization endpoint for Authorization Code flow with PKCE
 app.get('/authorize', (req, res) => {
   if (!SECURITY.oauth.enabled) {
@@ -425,12 +441,8 @@ app.get('/authorize', (req, res) => {
     return res.status(400).json({ error: 'invalid_request', error_description: 'Only S256 code_challenge_method is supported' });
   }
 
-  // Verify client exists
-  const client = SECURITY.oauthClients.get(client_id);
-  if (!client) {
-    logger.warn({ client_id }, 'Unknown OAuth client in authorize request');
-    return res.status(400).json({ error: 'invalid_client', error_description: 'Unknown client_id' });
-  }
+  // For PKCE flow, we accept any client_id (security comes from code_verifier)
+  // This allows Claude and other public clients to authenticate
 
   // Generate authorization code
   const code = randomUUID();
@@ -509,7 +521,7 @@ app.post('/oauth/token', (req, res) => {
       return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
     }
 
-    // Get client tier
+    // Get client tier (default to basic for public PKCE clients)
     const client = SECURITY.oauthClients.get(authCode.client_id);
     const tier = client?.tier || 'basic';
 
