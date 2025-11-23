@@ -13,7 +13,7 @@ jobs:
           fetch-depth: 0
 
       - name: Deploy to Clever Cloud
-        uses: 47ng/actions-clever-cloud@v2
+        uses: 47ng/actions-clever-cloud@v2.1.0
         with:
           appID: app_316f2298-980d-4b22-a52e-c77382e55099
         env:
