@@ -399,7 +399,9 @@ async function authMiddleware(req, res, next) {
 
 // OAuth 2.0 Authorization Server Metadata (RFC 8414)
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  // Use X-Forwarded-Proto for correct protocol behind reverse proxy
+  const protocol = req.get('X-Forwarded-Proto') || req.protocol;
+  const baseUrl = `${protocol}://${req.get('host')}`;
   res.json({
     issuer: baseUrl,
     authorization_endpoint: `${baseUrl}/authorize`,
