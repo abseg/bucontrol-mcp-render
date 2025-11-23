@@ -339,6 +339,15 @@ const app = express();
 app.use(cors({ origin: SECURITY.corsOrigins === '*' ? true : SECURITY.corsOrigins.split(','), credentials: true }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Set default Accept headers for MCP endpoints if not provided
+app.use('/mcp', (req, res, next) => {
+  if (!req.headers.accept || req.headers.accept === '*/*') {
+    req.headers.accept = 'application/json, text/event-stream';
+  }
+  next();
+});
+
 app.use((req, res, next) => { metrics.requestCount++; next(); });
 
 const limiter = rateLimit({ windowMs: SECURITY.defaultRateLimit.windowMs, max: SECURITY.defaultRateLimit.max, message: { error: 'Rate limit exceeded' } });
