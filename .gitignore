@@ -30,3 +30,4 @@ build/
 # Backup files
 *.backup
 *.bak
+.env.clever

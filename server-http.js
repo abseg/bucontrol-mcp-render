@@ -14,9 +14,12 @@ import { SocksProxyAgent } from 'socks-proxy-agent';
 import pino from 'pino';
 import { v4 as uuidv4 } from 'uuid';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import jwt from 'jsonwebtoken';
 import jwksRsa from 'jwks-rsa';
+
+// Authorization codes storage for PKCE flow (code -> { client_id, redirect_uri, code_challenge, code_challenge_method, scope, expires })
+const authorizationCodes = new Map();
 
 dotenv.config();
 
@@ -393,43 +396,169 @@ async function authMiddleware(req, res, next) {
   next();
 }
 
-// OAuth token endpoint for client credentials flow
+// OAuth authorization endpoint for Authorization Code flow with PKCE
+app.get('/authorize', (req, res) => {
+  if (!SECURITY.oauth.enabled) {
+    return res.status(400).json({ error: 'oauth_disabled', error_description: 'OAuth is not enabled' });
+  }
+
+  const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state, scope } = req.query;
+
+  // Validate required parameters
+  if (response_type !== 'code') {
+    return res.status(400).json({ error: 'unsupported_response_type', error_description: 'Only code response type is supported' });
+  }
+
+  if (!client_id) {
+    return res.status(400).json({ error: 'invalid_request', error_description: 'client_id is required' });
+  }
+
+  if (!redirect_uri) {
+    return res.status(400).json({ error: 'invalid_request', error_description: 'redirect_uri is required' });
+  }
+
+  if (!code_challenge) {
+    return res.status(400).json({ error: 'invalid_request', error_description: 'code_challenge is required for PKCE' });
+  }
+
+  if (code_challenge_method && code_challenge_method !== 'S256') {
+    return res.status(400).json({ error: 'invalid_request', error_description: 'Only S256 code_challenge_method is supported' });
+  }
+
+  // Verify client exists
+  const client = SECURITY.oauthClients.get(client_id);
+  if (!client) {
+    logger.warn({ client_id }, 'Unknown OAuth client in authorize request');
+    return res.status(400).json({ error: 'invalid_client', error_description: 'Unknown client_id' });
+  }
+
+  // Generate authorization code
+  const code = randomUUID();
+
+  // Store code with PKCE challenge (expires in 10 minutes)
+  authorizationCodes.set(code, {
+    client_id,
+    redirect_uri,
+    code_challenge,
+    code_challenge_method: code_challenge_method || 'S256',
+    scope: scope || '',
+    expires: Date.now() + 600000
+  });
+
+  logger.info({ client_id, scope }, 'Authorization code generated');
+
+  // Redirect back with code and state
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set('code', code);
+  if (state) {
+    redirectUrl.searchParams.set('state', state);
+  }
+
+  res.redirect(redirectUrl.toString());
+});
+
+// OAuth token endpoint for client credentials and authorization code flows
 app.post('/oauth/token', (req, res) => {
   if (!SECURITY.oauth.enabled) {
     return res.status(400).json({ error: 'oauth_disabled', error_description: 'OAuth is not enabled' });
   }
 
-  const { grant_type, client_id, client_secret } = req.body;
+  const { grant_type, client_id, client_secret, code, code_verifier, redirect_uri } = req.body;
 
-  if (grant_type !== 'client_credentials') {
-    return res.status(400).json({ error: 'unsupported_grant_type', error_description: 'Only client_credentials grant type is supported' });
+  // Handle Authorization Code grant (PKCE)
+  if (grant_type === 'authorization_code') {
+    if (!code) {
+      return res.status(400).json({ error: 'invalid_request', error_description: 'code is required' });
+    }
+
+    if (!code_verifier) {
+      return res.status(400).json({ error: 'invalid_request', error_description: 'code_verifier is required for PKCE' });
+    }
+
+    // Retrieve and validate authorization code
+    const authCode = authorizationCodes.get(code);
+    if (!authCode) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
+    }
+
+    // Delete code immediately (one-time use)
+    authorizationCodes.delete(code);
+
+    // Check expiration
+    if (Date.now() > authCode.expires) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code expired' });
+    }
+
+    // Validate client_id matches
+    if (client_id && client_id !== authCode.client_id) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+    }
+
+    // Validate redirect_uri matches
+    if (redirect_uri && redirect_uri !== authCode.redirect_uri) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+    }
+
+    // Verify PKCE code_verifier
+    const expectedChallenge = createHash('sha256')
+      .update(code_verifier)
+      .digest('base64url');
+
+    if (expectedChallenge !== authCode.code_challenge) {
+      logger.warn({ client_id: authCode.client_id }, 'PKCE verification failed');
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+    }
+
+    // Get client tier
+    const client = SECURITY.oauthClients.get(authCode.client_id);
+    const tier = client?.tier || 'basic';
+
+    // Generate access token
+    const token = jwt.sign(
+      { sub: authCode.client_id, tier, type: 'access_token', scope: authCode.scope },
+      SECURITY.oauth.secret,
+      { algorithm: 'HS256', expiresIn: SECURITY.oauth.tokenExpiry }
+    );
+
+    logger.info({ client_id: authCode.client_id, tier }, 'OAuth token issued via authorization_code');
+
+    return res.json({
+      access_token: token,
+      token_type: 'Bearer',
+      expires_in: 86400
+    });
   }
 
-  if (!client_id || !client_secret) {
-    return res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret are required' });
+  // Handle Client Credentials grant
+  if (grant_type === 'client_credentials') {
+    if (!client_id || !client_secret) {
+      return res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret are required' });
+    }
+
+    const client = SECURITY.oauthClients.get(client_id);
+    if (!client || client.secret !== client_secret) {
+      metrics.errorCount++;
+      logger.warn({ client_id }, 'Invalid OAuth client credentials');
+      return res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client credentials' });
+    }
+
+    // Generate access token
+    const token = jwt.sign(
+      { sub: client_id, tier: client.tier, type: 'access_token' },
+      SECURITY.oauth.secret,
+      { algorithm: 'HS256', expiresIn: SECURITY.oauth.tokenExpiry }
+    );
+
+    logger.info({ client_id, tier: client.tier }, 'OAuth token issued via client_credentials');
+
+    return res.json({
+      access_token: token,
+      token_type: 'Bearer',
+      expires_in: 86400
+    });
   }
 
-  const client = SECURITY.oauthClients.get(client_id);
-  if (!client || client.secret !== client_secret) {
-    metrics.errorCount++;
-    logger.warn({ client_id }, 'Invalid OAuth client credentials');
-    return res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client credentials' });
-  }
-
-  // Generate access token
-  const token = jwt.sign(
-    { sub: client_id, tier: client.tier, type: 'access_token' },
-    SECURITY.oauth.secret,
-    { algorithm: 'HS256', expiresIn: SECURITY.oauth.tokenExpiry }
-  );
-
-  logger.info({ client_id, tier: client.tier }, 'OAuth token issued');
-
-  res.json({
-    access_token: token,
-    token_type: 'Bearer',
-    expires_in: 86400
-  });
+  return res.status(400).json({ error: 'unsupported_grant_type', error_description: 'Supported grant types: authorization_code, client_credentials' });
 });
 
 app.get('/health', (req, res) => res.json({ status: isConnected && isIdentified ? 'healthy' : 'degraded', websocket: { connected: isConnected, identified: isIdentified }, components: Object.keys(discoveredComponents.list).length, uptime: Math.floor((Date.now() - metrics.startTime) / 1000) }));
