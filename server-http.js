@@ -17,6 +17,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { randomUUID, createHash } from 'crypto';
 import jwt from 'jsonwebtoken';
 import jwksRsa from 'jwks-rsa';
+import { createVoiceRouter } from './voice-endpoint.js';
 
 // Authorization codes storage for PKCE flow (code -> { client_id, redirect_uri, code_challenge, code_challenge_method, scope, expires })
 const authorizationCodes = new Map();
@@ -383,7 +384,7 @@ async function authMiddleware(req, res, next) {
   // Fall back to API key authentication
   if (!SECURITY.requireApiKey) return next();
 
-  const key = req.headers['x-api-key'] || req.query.apiKey;
+  const key = req.headers['x-api-key'] || req.headers['x-vapi-secret'] || req.query.apiKey;
   if (!key) {
     return res.status(401).json({
       error: 'Authentication required',
@@ -592,6 +593,10 @@ app.get('/metrics', (req, res) => {
   const toolCallsStr = Array.from(metrics.toolCalls.entries()).map(([k, v]) => `mcp_tool_calls{tool="${k}"} ${v}`).join('\n');
   res.type('text/plain').send(`# HELP mcp_requests_total Total requests\nmcp_requests_total ${metrics.requestCount}\n# HELP mcp_errors_total Total errors\nmcp_errors_total ${metrics.errorCount}\n# HELP mcp_websocket_connected WebSocket status\nmcp_websocket_connected ${isConnected ? 1 : 0}\n# HELP mcp_components_discovered Discovered components\nmcp_components_discovered ${Object.keys(discoveredComponents.list).length}\n# HELP mcp_sessions_active Active sessions\nmcp_sessions_active ${sessionManager.sessions.size}\n# HELP mcp_uptime_seconds Uptime\nmcp_uptime_seconds ${Math.floor((Date.now() - metrics.startTime) / 1000)}\n${toolCallsStr}`);
 });
+
+// Voice webhook router for VAPI integration
+const voiceRouter = createVoiceRouter(CONFIG, authMiddleware);
+app.use('/voice', voiceRouter);
 
 // Streamable HTTP transport - session management
 const transports = new Map();

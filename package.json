@@ -36,7 +36,8 @@
     "socks-proxy-agent": "^8.0.2",
     "pino": "^8.16.2",
     "pino-pretty": "^10.2.3",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "@google/generative-ai": "^0.21.0"
   },
   "devDependencies": {
     "supertest": "^6.3.4"
