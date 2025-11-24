@@ -22,6 +22,13 @@ import { createVoiceRouter } from './voice-endpoint.js';
 // Authorization codes storage for PKCE flow (code -> { client_id, redirect_uri, code_challenge, code_challenge_method, scope, expires })
 const authorizationCodes = new Map();
 
+// Microsoft Graph tokens storage (per room/session)
+// In production, consider Redis or database for persistence
+const msGraphTokens = {
+  current: null, // { accessToken, refreshToken, expiresAt, user }
+  history: []
+};
+
 dotenv.config();
 
 const logger = pino({
@@ -303,7 +310,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     { name: 'get_component_details', description: 'Get component details', inputSchema: { type: 'object', properties: { componentName: { type: 'string' } }, required: ['componentName'] } },
     { name: 'set_control_generic', description: 'Set any control value', inputSchema: { type: 'object', properties: { componentName: { type: 'string' }, controlId: { type: 'string' }, value: {} }, required: ['componentName', 'controlId', 'value'] } },
     { name: 'get_connection_status', description: 'Get connection status', inputSchema: { type: 'object', properties: {} } },
-    { name: 'reconnect', description: 'Force reconnection', inputSchema: { type: 'object', properties: {} } }
+    { name: 'reconnect', description: 'Force reconnection', inputSchema: { type: 'object', properties: {} } },
+    // Microsoft Graph tools
+    { name: 'graph_get_user', description: 'Get signed-in Microsoft user info', inputSchema: { type: 'object', properties: {} } },
+    { name: 'graph_list_recent_files', description: 'List user\'s recently accessed files from OneDrive/SharePoint', inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max files to return (default 10)' } } } },
+    { name: 'graph_list_presentations', description: 'List user\'s PowerPoint presentations', inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max files to return (default 10)' } } } },
+    { name: 'graph_get_file_info', description: 'Get details about a specific file by ID', inputSchema: { type: 'object', properties: { fileId: { type: 'string' } }, required: ['fileId'] } },
+    { name: 'graph_get_file_content_url', description: 'Get download/embed URL for a file', inputSchema: { type: 'object', properties: { fileId: { type: 'string' } }, required: ['fileId'] } }
   ]
 }));
 
@@ -330,6 +343,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'set_control_generic': { const c = findComponent(args.componentName); if (!c) throw new Error('Component not found'); return { content: [{ type: 'text', text: JSON.stringify(await sendControl(c.id, args.controlId, args.value)) }] }; }
       case 'get_connection_status': return { content: [{ type: 'text', text: JSON.stringify({ connected: isConnected, identified: isIdentified, components: Object.keys(discoveredComponents.list).length }) }] };
       case 'reconnect': { if (socket) { socket.disconnect(); isConnected = false; isIdentified = false; await initWebSocket(); return { content: [{ type: 'text', text: JSON.stringify({ success: true, components: Object.keys(discoveredComponents.list).length }) }] }; } throw new Error('No connection'); }
+      // Microsoft Graph tools
+      case 'graph_get_user': {
+        const user = await callGraphAPI('/me');
+        return { content: [{ type: 'text', text: JSON.stringify({ displayName: user.displayName, email: user.mail || user.userPrincipalName, jobTitle: user.jobTitle, department: user.department }) }] };
+      }
+      case 'graph_list_recent_files': {
+        const limit = args.limit || 10;
+        const result = await callGraphAPI(`/me/drive/recent?$top=${limit}`);
+        const files = result.value.map(f => ({ id: f.id, name: f.name, webUrl: f.webUrl, lastModified: f.lastModifiedDateTime, size: f.size, mimeType: f.file?.mimeType }));
+        return { content: [{ type: 'text', text: JSON.stringify({ count: files.length, files }) }] };
+      }
+      case 'graph_list_presentations': {
+        const limit = args.limit || 10;
+        // Search for PowerPoint files
+        const result = await callGraphAPI(`/me/drive/root/search(q='.pptx')?$top=${limit}&$orderby=lastModifiedDateTime desc`);
+        const files = result.value.map(f => ({ id: f.id, name: f.name, webUrl: f.webUrl, lastModified: f.lastModifiedDateTime, size: f.size }));
+        return { content: [{ type: 'text', text: JSON.stringify({ count: files.length, presentations: files }) }] };
+      }
+      case 'graph_get_file_info': {
+        const file = await callGraphAPI(`/me/drive/items/${args.fileId}`);
+        return { content: [{ type: 'text', text: JSON.stringify({ id: file.id, name: file.name, webUrl: file.webUrl, size: file.size, lastModified: file.lastModifiedDateTime, createdBy: file.createdBy?.user?.displayName, mimeType: file.file?.mimeType }) }] };
+      }
+      case 'graph_get_file_content_url': {
+        const file = await callGraphAPI(`/me/drive/items/${args.fileId}`);
+        // Get a sharing link for embedding
+        const shareResult = await callGraphAPI(`/me/drive/items/${args.fileId}/createLink`, {
+          method: 'POST',
+          body: JSON.stringify({ type: 'embed', scope: 'organization' })
+        });
+        return { content: [{ type: 'text', text: JSON.stringify({ id: file.id, name: file.name, downloadUrl: file['@microsoft.graph.downloadUrl'], embedUrl: shareResult.link?.webUrl, webUrl: file.webUrl }) }] };
+      }
       default: throw new Error(`Unknown tool: ${name}`);
     }
   } catch (e) { metrics.toolErrors.set(name, (metrics.toolErrors.get(name) || 0) + 1); metrics.errorCount++; return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }], isError: true }; }
@@ -597,6 +641,158 @@ app.get('/metrics', (req, res) => {
 // Voice webhook router for VAPI integration
 const voiceRouter = createVoiceRouter(CONFIG, authMiddleware);
 app.use('/voice', voiceRouter);
+
+// Microsoft Graph token endpoint - receives tokens from orb UI
+app.post('/auth/microsoft', authMiddleware, (req, res) => {
+  const { accessToken, refreshToken, expiresIn, user } = req.body;
+
+  if (!accessToken) {
+    return res.status(400).json({ error: 'accessToken is required' });
+  }
+
+  // Store the token
+  msGraphTokens.current = {
+    accessToken,
+    refreshToken,
+    expiresAt: Date.now() + (expiresIn || 3600) * 1000,
+    user,
+    receivedAt: Date.now()
+  };
+
+  // Keep history for audit
+  msGraphTokens.history.push({
+    user: user?.displayName || user?.userPrincipalName || 'Unknown',
+    timestamp: Date.now()
+  });
+
+  // Limit history to last 50 entries
+  if (msGraphTokens.history.length > 50) {
+    msGraphTokens.history = msGraphTokens.history.slice(-50);
+  }
+
+  logger.info({ user: user?.displayName }, 'Microsoft Graph token received');
+
+  res.json({ success: true, user: user?.displayName });
+});
+
+// Get current Microsoft auth status
+app.get('/auth/microsoft', authMiddleware, (req, res) => {
+  if (!msGraphTokens.current) {
+    return res.json({ authenticated: false });
+  }
+
+  const isExpired = Date.now() > msGraphTokens.current.expiresAt;
+  res.json({
+    authenticated: !isExpired,
+    user: msGraphTokens.current.user?.displayName,
+    expiresAt: msGraphTokens.current.expiresAt,
+    isExpired
+  });
+});
+
+// Azure AD Device Code Flow proxy endpoints (to bypass CORS restrictions)
+// These proxy the browser's requests to Azure AD since the browser can't call Azure AD directly
+
+// Proxy for device code request
+app.post('/auth/microsoft/devicecode', async (req, res) => {
+  const { client_id, scope, tenant = 'organizations' } = req.body;
+
+  if (!client_id) {
+    return res.status(400).json({ error: 'client_id is required' });
+  }
+
+  try {
+    const response = await fetch(
+      `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/devicecode`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id,
+          scope: scope || 'User.Read Files.Read offline_access'
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      logger.warn({ error: data.error, description: data.error_description }, 'Azure AD device code error');
+      return res.status(response.status).json(data);
+    }
+
+    logger.info({ user_code: data.user_code }, 'Device code issued');
+    res.json(data);
+  } catch (error) {
+    logger.error({ error: error.message }, 'Device code proxy error');
+    res.status(500).json({ error: 'Failed to get device code', error_description: error.message });
+  }
+});
+
+// Proxy for token polling
+app.post('/auth/microsoft/token', async (req, res) => {
+  const { client_id, device_code, grant_type, tenant = 'organizations' } = req.body;
+
+  if (!client_id || !device_code) {
+    return res.status(400).json({ error: 'client_id and device_code are required' });
+  }
+
+  try {
+    const response = await fetch(
+      `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id,
+          grant_type: grant_type || 'urn:ietf:params:oauth:grant-type:device_code',
+          device_code
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok && data.error !== 'authorization_pending' && data.error !== 'slow_down') {
+      logger.warn({ error: data.error }, 'Azure AD token error');
+    }
+
+    // Return the response as-is (including authorization_pending errors)
+    res.status(response.ok ? 200 : response.status).json(data);
+  } catch (error) {
+    logger.error({ error: error.message }, 'Token proxy error');
+    res.status(500).json({ error: 'Failed to get token', error_description: error.message });
+  }
+});
+
+// Helper function to call Microsoft Graph API
+async function callGraphAPI(endpoint, options = {}) {
+  if (!msGraphTokens.current) {
+    throw new Error('No Microsoft account signed in. Please sign in from the room display.');
+  }
+
+  if (Date.now() > msGraphTokens.current.expiresAt) {
+    throw new Error('Microsoft token expired. Please sign in again from the room display.');
+  }
+
+  const url = endpoint.startsWith('http') ? endpoint : `https://graph.microsoft.com/v1.0${endpoint}`;
+
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${msGraphTokens.current.accessToken}`,
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
+    throw new Error(error.error?.message || `Graph API error: ${response.status}`);
+  }
+
+  return response.json();
+}
 
 // Streamable HTTP transport - session management
 const transports = new Map();
