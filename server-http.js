@@ -643,7 +643,8 @@ const voiceRouter = createVoiceRouter(CONFIG, authMiddleware);
 app.use('/voice', voiceRouter);
 
 // Microsoft Graph token endpoint - receives tokens from orb UI
-app.post('/auth/microsoft', authMiddleware, (req, res) => {
+// No auth required - this is called from kiosk displays
+app.post('/auth/microsoft', (req, res) => {
   const { accessToken, refreshToken, expiresIn, user } = req.body;
 
   if (!accessToken) {
