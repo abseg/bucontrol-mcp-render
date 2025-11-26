@@ -51,7 +51,21 @@ class WebSocketManager {
       samples: []
     };
 
-    // Controller status
+    // Connection health monitoring
+    // Server sends ping every 25s and expects pong within 60s
+    // Server disconnects client if no ping received for 90s
+    this.connectionHealth = {
+      lastPingSent: 0,
+      lastPongReceived: 0,
+      missedPongs: 0,
+      maxMissedPongs: 3,       // Reconnect after 3 missed pongs (75s without response)
+      pongTimeout: 30000       // Consider pong missed if not received within 30s
+    };
+
+    // Connection monitor interval reference
+    this.connectionMonitorInterval = null;
+
+        // Controller status
     this.controllerStatus = {
       connected: false,
       health: 'unknown',
@@ -139,6 +153,12 @@ class WebSocketManager {
         clearTimeout(timeout);
         this.isConnected = true;
         this.reconnectAttempt = 0;
+        
+
+        // Reset connection health on new connection
+        this.connectionHealth.lastPongReceived = Date.now();
+        this.connectionHealth.missedPongs = 0;
+
         logger.info('Connected to WebSocket bridge V2');
 
         try {
@@ -187,6 +207,11 @@ class WebSocketManager {
       this.socket.on('reconnect', async (attemptNumber) => {
         logger.info({ attemptNumber }, 'Reconnected to WebSocket');
         this.isConnected = true;
+
+        // Reset connection health on reconnection
+        this.connectionHealth.lastPongReceived = Date.now();
+        this.connectionHealth.missedPongs = 0;
+
         try {
           await this.identify();
           await this.discoverComponents();
@@ -205,8 +230,12 @@ class WebSocketManager {
         logger.warn({ error: e.message }, 'Reconnection error');
       });
 
-      // Handle pong response for latency tracking
+      // Handle pong response for latency and health tracking
       this.socket.on('pong', (data) => {
+        // Update connection health - server responded
+        this.connectionHealth.lastPongReceived = Date.now();
+        this.connectionHealth.missedPongs = 0;
+
         if (data.clientTimestamp) {
           const latency = Date.now() - data.clientTimestamp;
           this.latency.current = latency;
@@ -253,9 +282,39 @@ class WebSocketManager {
       // Heartbeat to keep SOCKS proxy connection alive (ping only, no redundant subscribe)
       this.heartbeatInterval = setInterval(() => {
         if (this.isConnected && this.socket) {
+          this.connectionHealth.lastPingSent = Date.now();
           this.socket.emit('ping', { timestamp: Date.now() });
         }
       }, 25000);
+
+      // Connection health monitor - check for stale connections
+      this.connectionMonitorInterval = setInterval(() => {
+        if (!this.isConnected) return;
+
+        const now = Date.now();
+        const timeSinceLastPong = now - this.connectionHealth.lastPongReceived;
+
+        // If we've sent a ping but haven't received pong within timeout, count it as missed
+        if (this.connectionHealth.lastPingSent > this.connectionHealth.lastPongReceived &&
+            timeSinceLastPong > this.connectionHealth.pongTimeout) {
+          this.connectionHealth.missedPongs++;
+          logger.warn({
+            missedPongs: this.connectionHealth.missedPongs,
+            timeSinceLastPong: Math.round(timeSinceLastPong / 1000)
+          }, 'Missed pong response');
+
+          // If we've missed too many pongs, force reconnect
+          if (this.connectionHealth.missedPongs >= this.connectionHealth.maxMissedPongs) {
+            logger.error({
+              missedPongs: this.connectionHealth.missedPongs,
+              timeSinceLastPong: Math.round(timeSinceLastPong / 1000)
+            }, 'Connection stale - forcing reconnect');
+            this.reconnect().catch(e => {
+              logger.error({ error: e.message }, 'Auto-reconnect failed');
+            });
+          }
+        }
+      }, 30000); // Check every 30 seconds
 
       // Handle state updates
       this.socket.on('control:update', (data) => this.handleControlUpdate(data));
@@ -640,12 +699,44 @@ class WebSocketManager {
   }
 
   /**
+   * Get connection health status
+   */
+  getConnectionHealth() {
+    const now = Date.now();
+    const timeSinceLastPong = now - this.connectionHealth.lastPongReceived;
+
+    let health = 'healthy';
+    if (!this.isConnected) {
+      health = 'disconnected';
+    } else if (this.connectionHealth.missedPongs >= 2) {
+      health = 'degraded';
+    } else if (timeSinceLastPong > 60000) {
+      health = 'stale';
+    }
+
+    return {
+      health,
+      connected: this.isConnected,
+      identified: this.isIdentified,
+      lastPingSent: this.connectionHealth.lastPingSent,
+      lastPongReceived: this.connectionHealth.lastPongReceived,
+      timeSinceLastPong: Math.round(timeSinceLastPong / 1000),
+      missedPongs: this.connectionHealth.missedPongs,
+      latency: this.latency.average
+    };
+  }
+
+  /**
    * Disconnect
    */
   disconnect() {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
+    }
+    if (this.connectionMonitorInterval) {
+      clearInterval(this.connectionMonitorInterval);
+      this.connectionMonitorInterval = null;
     }
     if (this.socket) {
       this.socket.disconnect();

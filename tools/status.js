@@ -90,6 +90,7 @@ export const statusTools = [
   {
     name: 'reconnect',
     description: 'Force WebSocket reconnection',
+    voiceDescription: 'Reconnect to the room control system. Use when health is degraded or when told to reconnect.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (args, ctx) => {
       await ctx.ws.reconnect();
