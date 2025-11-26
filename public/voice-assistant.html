@@ -1,0 +1,1390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Amen - Unified Server Test</title>
+    <script type="importmap">
+    {
+        "imports": {
+            "/npm/@daily-co/daily-js@0.85.0/+esm": "https://cdn.jsdelivr.net/npm/@daily-co/daily-js@0.85.0/+esm",
+            "/npm/events@3.3.0/+esm": "https://cdn.jsdelivr.net/npm/events@3.3.0/+esm"
+        }
+    }
+    </script>
+    <!-- QR Code Generator -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
+            background: #0a0a0f;
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .header {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .header-icon {
+            width: 24px;
+            height: 24px;
+            background: linear-gradient(135deg, #00d4aa, #0891b2);
+            border-radius: 6px;
+        }
+
+        .header-title {
+            font-size: 16px;
+            font-weight: 500;
+            color: #fff;
+        }
+
+        .main-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .assistant-name {
+            font-size: 28px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .assistant-subtitle {
+            font-size: 16px;
+            color: #666;
+            margin-bottom: 20px;
+            transition: opacity 0.3s;
+        }
+
+        .orb-container {
+            position: relative;
+            width: 280px;
+            height: 280px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .orb {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: conic-gradient(
+                from 0deg,
+                #0891b2 0deg,
+                #00d4aa 60deg,
+                #0891b2 120deg,
+                #00d4aa 180deg,
+                #0891b2 240deg,
+                #00d4aa 300deg,
+                #0891b2 360deg
+            );
+            opacity: 0.3;
+            animation: rotate 20s linear infinite;
+        }
+
+        .orb::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 85%;
+            height: 85%;
+            border-radius: 50%;
+            background: #0a0a0f;
+        }
+
+        .orb-inner {
+            position: absolute;
+            width: 70%;
+            height: 70%;
+            border-radius: 50%;
+            background: conic-gradient(
+                from 180deg,
+                #00d4aa 0deg,
+                #0891b2 90deg,
+                #00d4aa 180deg,
+                #0891b2 270deg,
+                #00d4aa 360deg
+            );
+            opacity: 0.5;
+            animation: rotate 15s linear infinite reverse;
+        }
+
+        .orb-inner::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 80%;
+            height: 80%;
+            border-radius: 50%;
+            background: #0a0a0f;
+        }
+
+        .orb-center {
+            position: absolute;
+            width: 45%;
+            height: 45%;
+            border-radius: 50%;
+            background: radial-gradient(circle, #1a1a2e 0%, #0a0a0f 100%);
+            box-shadow: 0 0 60px rgba(0, 212, 170, 0.2);
+        }
+
+        @keyframes rotate {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .orb-container.active .orb {
+            opacity: 0.6;
+            animation: rotate 8s linear infinite, pulse 2s ease-in-out infinite;
+        }
+
+        .orb-container.active .orb-inner {
+            opacity: 0.8;
+            animation: rotate 6s linear infinite reverse, pulse 1.5s ease-in-out infinite;
+        }
+
+        .orb-container.active .orb-center {
+            box-shadow: 0 0 80px rgba(0, 212, 170, 0.4);
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: rotate(0deg) scale(1); }
+            50% { transform: rotate(180deg) scale(1.05); }
+        }
+
+        .call-button {
+            position: absolute;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 14px 28px;
+            border-radius: 30px;
+            border: none;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .call-button.start {
+            background: #fff;
+            color: #000;
+        }
+
+        .call-button.start:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 30px rgba(255, 255, 255, 0.2);
+        }
+
+        .call-button.end {
+            background: #ef4444;
+            color: #fff;
+        }
+
+        .call-button.end:hover {
+            background: #dc2626;
+        }
+
+        .call-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .call-button svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        .status-indicator {
+            position: absolute;
+            bottom: -60px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #333;
+        }
+
+        .status-dot.connecting {
+            background: #f59e0b;
+            animation: blink 1s ease-in-out infinite;
+        }
+
+        .status-dot.connected {
+            background: #00d4aa;
+        }
+
+        .status-dot.error {
+            background: #ef4444;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .duration {
+            position: absolute;
+            bottom: -90px;
+            font-size: 24px;
+            font-weight: 300;
+            color: #00d4aa;
+            font-variant-numeric: tabular-nums;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .duration.active {
+            opacity: 1;
+        }
+
+        .transcript {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            max-width: 80%;
+            text-align: center;
+            font-size: 14px;
+            color: #888;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .transcript.active {
+            opacity: 1;
+        }
+
+        /* Microsoft Login UI */
+        .login-button {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            background: rgba(255, 255, 255, 0.05);
+            color: #888;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .login-button:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: #00d4aa;
+            color: #fff;
+        }
+
+        .login-button.logged-in {
+            border-color: #00d4aa;
+            color: #00d4aa;
+        }
+
+        .login-button svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .login-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .login-modal.active {
+            display: flex;
+        }
+
+        .login-modal-content {
+            background: #1a1a2e;
+            border-radius: 16px;
+            padding: 40px;
+            text-align: center;
+            max-width: 400px;
+            width: 90%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+
+        .login-modal-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .login-modal-subtitle {
+            font-size: 14px;
+            color: #888;
+            margin-bottom: 24px;
+        }
+
+        .qr-container {
+            background: #fff;
+            border-radius: 12px;
+            padding: 16px;
+            display: inline-block;
+            margin-bottom: 20px;
+        }
+
+        .qr-container canvas {
+            display: block;
+        }
+
+        .user-code {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: 4px;
+            color: #00d4aa;
+            margin-bottom: 16px;
+        }
+
+        .login-instructions {
+            font-size: 13px;
+            color: #666;
+            line-height: 1.6;
+        }
+
+        .login-status {
+            margin-top: 20px;
+            font-size: 13px;
+            color: #888;
+        }
+
+        .login-status.success {
+            color: #00d4aa;
+        }
+
+        .login-status.error {
+            color: #ef4444;
+        }
+
+        .login-cancel {
+            margin-top: 20px;
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            background: transparent;
+            color: #888;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .login-cancel:hover {
+            border-color: #666;
+            color: #fff;
+        }
+
+        .user-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #00d4aa, #0891b2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        /* Present Button */
+        .present-button {
+            position: absolute;
+            top: 20px;
+            right: 140px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            background: rgba(255, 255, 255, 0.05);
+            color: #888;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .present-button:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: #f59e0b;
+            color: #fff;
+        }
+
+        .present-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .present-button.loading {
+            border-color: #f59e0b;
+            color: #f59e0b;
+        }
+
+        .present-button svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .present-button .spinner {
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* File Picker Modal */
+        .file-picker-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .file-picker-overlay.visible {
+            display: flex;
+        }
+
+        .file-picker {
+            background: rgba(30, 30, 30, 0.95);
+            border-radius: 16px;
+            padding: 24px;
+            max-width: 400px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .file-picker h3 {
+            margin: 0 0 16px 0;
+            font-size: 18px;
+            color: #fff;
+            font-weight: 500;
+        }
+
+        .file-section {
+            margin-bottom: 16px;
+        }
+
+        .file-section-title {
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.5);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .file-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border: 1px solid transparent;
+        }
+
+        .file-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(245, 158, 11, 0.5);
+        }
+
+        .file-item:active {
+            transform: scale(0.98);
+        }
+
+        .file-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+
+        .file-icon.pptx {
+            background: #d14424;
+            color: white;
+        }
+
+        .file-icon.pdf {
+            background: #ff0000;
+            color: white;
+        }
+
+        .file-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .file-name {
+            font-size: 14px;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .file-date {
+            font-size: 11px;
+            color: rgba(255, 255, 255, 0.4);
+            margin-top: 2px;
+        }
+
+        .file-picker-close {
+            width: 100%;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            border-radius: 8px;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 14px;
+            cursor: pointer;
+            margin-top: 8px;
+            transition: all 0.2s ease;
+        }
+
+        .file-picker-close:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: #fff;
+        }
+
+        .file-picker-empty {
+            text-align: center;
+            padding: 20px;
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-icon"></div>
+        <span class="header-title">Unified Server Test</span>
+    </div>
+
+    <!-- Present Button -->
+    <button class="present-button" id="presentButton" onclick="presentKeynote()">
+        <svg id="presentIcon" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12zM10 8v6l5-3z"/>
+        </svg>
+        <span id="presentButtonText">Present</span>
+    </button>
+
+    <!-- File Picker Modal -->
+    <div class="file-picker-overlay" id="filePickerOverlay" onclick="closeFilePicker(event)">
+        <div class="file-picker" onclick="event.stopPropagation()">
+            <h3>Select Presentation</h3>
+            <div id="filePickerContent"></div>
+            <button class="file-picker-close" onclick="closeFilePicker()">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Microsoft Login Button -->
+    <button class="login-button" id="loginButton" onclick="startMicrosoftLogin()">
+        <svg viewBox="0 0 21 21" fill="currentColor">
+            <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+            <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+            <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+            <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+        </svg>
+        <span id="loginButtonText">Sign in</span>
+    </button>
+
+    <!-- Login Modal -->
+    <div class="login-modal" id="loginModal">
+        <div class="login-modal-content">
+            <h2 class="login-modal-title">Sign in with Microsoft</h2>
+            <p class="login-modal-subtitle">Scan the QR code with your phone</p>
+
+            <div class="qr-container" id="qrContainer">
+                <!-- QR code will be generated here -->
+            </div>
+
+            <div class="user-code" id="userCode" style="font-size: 20px; letter-spacing: 2px; margin: 12px 0 8px;">--------</div>
+
+            <p class="login-instructions" style="margin: 0; font-size: 11px;">
+                Scan QR or enter code at <strong>microsoft.com/devicelogin</strong>
+            </p>
+
+            <div class="login-status" id="loginStatus">Waiting for authentication...</div>
+
+            <button class="login-cancel" onclick="cancelLogin()">Cancel</button>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <h1 class="assistant-name">Amen</h1>
+        <p class="assistant-subtitle" id="subtitle">How may I help you today?</p>
+
+        <div class="orb-container" id="orbContainer">
+            <div class="orb"></div>
+            <div class="orb-inner"></div>
+            <div class="orb-center"></div>
+
+            <button class="call-button start" id="callButton" onclick="toggleCall()">
+                <svg id="phoneIcon" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 15c1.66 0 3-1.34 3-3V6c0-1.66-1.34-3-3-3S9 4.34 9 6v6c0 1.66 1.34 3 3 3zm5-3c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-2.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                </svg>
+                <span id="buttonText">Start a call</span>
+            </button>
+
+            <div class="status-indicator">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Ready</span>
+            </div>
+
+            <div class="duration" id="duration">00:00</div>
+        </div>
+    </div>
+
+    <div class="transcript" id="transcript"></div>
+
+    <script>
+        let vapi = null;
+        let isCallActive = false;
+        let durationInterval = null;
+        let callStartTime = null;
+
+        window.PUBLIC_KEY = '2875f147-aae8-4cfb-ac45-6f54a071933e';
+        window.ASSISTANT_ID = '06e5358d-ad54-4636-8a74-877918b8315b';
+
+        // Microsoft Graph Configuration
+        const MS_CONFIG = {
+            clientId: 'f85ec32f-bad9-440e-acb3-88d5b55d2ae6',
+            tenant: 'organizations', // Multi-tenant (any org)
+            scopes: ['User.Read', 'Files.Read', 'offline_access'],
+            mcpServerUrl: window.location.origin // Or your MCP server URL
+        };
+
+        let msAuthState = {
+            accessToken: null,
+            refreshToken: null,
+            user: null,
+            pollInterval: null
+        };
+
+        // Get MCP server URL - use same origin since we're hosted on the unified server
+        function getMcpServerUrl() {
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get('mcpServer')) {
+                return urlParams.get('mcpServer');
+            }
+            // Use same origin (works with Tailscale or any access method)
+            return window.location.origin;
+        }
+
+        // Load persisted auth state from localStorage
+        function loadAuthState() {
+            try {
+                const saved = localStorage.getItem('msAuthState');
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    // Check if token is expired
+                    if (parsed.expiresAt && Date.now() < parsed.expiresAt) {
+                        msAuthState.accessToken = parsed.accessToken;
+                        msAuthState.refreshToken = parsed.refreshToken;
+                        msAuthState.user = parsed.user;
+                        updateLoginButton();
+                        console.log('[MS Auth] Restored session for:', parsed.user?.displayName);
+                        return true;
+                    } else {
+                        // Token expired, clear it
+                        localStorage.removeItem('msAuthState');
+                        console.log('[MS Auth] Stored token expired');
+                    }
+                }
+            } catch (e) {
+                console.error('[MS Auth] Failed to load auth state:', e);
+            }
+            return false;
+        }
+
+        // Save auth state to localStorage
+        function saveAuthState() {
+            try {
+                const toSave = {
+                    accessToken: msAuthState.accessToken,
+                    refreshToken: msAuthState.refreshToken,
+                    user: msAuthState.user,
+                    expiresAt: Date.now() + (3600 * 1000) // 1 hour from now
+                };
+                localStorage.setItem('msAuthState', JSON.stringify(toSave));
+                console.log('[MS Auth] Saved session to localStorage');
+            } catch (e) {
+                console.error('[MS Auth] Failed to save auth state:', e);
+            }
+        }
+
+        // Clear auth state from localStorage
+        function clearAuthState() {
+            localStorage.removeItem('msAuthState');
+            console.log('[MS Auth] Cleared session from localStorage');
+        }
+
+        // Check server's auth status and sync with client
+        async function syncAuthWithServer() {
+            try {
+                const mcpUrl = getMcpServerUrl();
+                const response = await fetch(`${mcpUrl}/auth/microsoft`, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.authenticated && data.user) {
+                        // Server has auth, update client state
+                        msAuthState.user = { displayName: data.user };
+                        updateLoginButton();
+                        console.log('[MS Auth] Synced with server - logged in as:', data.user);
+                        return true;
+                    }
+                }
+            } catch (e) {
+                console.error('[MS Auth] Failed to sync with server:', e);
+            }
+            return false;
+        }
+
+        // Start Microsoft Device Code Flow
+        async function startMicrosoftLogin() {
+            if (msAuthState.user) {
+                // Already logged in - show logout option
+                if (confirm(`Signed in as ${msAuthState.user.displayName}\n\nSign out?`)) {
+                    signOutMicrosoft();
+                }
+                return;
+            }
+
+            const modal = document.getElementById('loginModal');
+            const statusEl = document.getElementById('loginStatus');
+            const userCodeEl = document.getElementById('userCode');
+
+            modal.classList.add('active');
+            statusEl.textContent = 'Initializing...';
+            statusEl.className = 'login-status';
+
+            try {
+                const mcpUrl = getMcpServerUrl();
+
+                // Request device code via MCP server proxy (bypasses CORS)
+                const deviceCodeResponse = await fetch(
+                    `${mcpUrl}/auth/microsoft/devicecode`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            client_id: MS_CONFIG.clientId,
+                            scope: MS_CONFIG.scopes.join(' '),
+                            tenant: MS_CONFIG.tenant
+                        })
+                    }
+                );
+
+                if (!deviceCodeResponse.ok) {
+                    const errorData = await deviceCodeResponse.json().catch(() => ({}));
+                    console.error('[MS Auth] Device code error:', errorData);
+                    throw new Error(errorData.error_description || errorData.error || `Failed to get device code: ${deviceCodeResponse.status}`);
+                }
+
+                const deviceCode = await deviceCodeResponse.json();
+                console.log('[MS Auth] Device code received:', deviceCode);
+
+                // Display user code
+                userCodeEl.textContent = deviceCode.user_code;
+
+                // Generate QR code with code embedded in URL
+                const qrContainer = document.getElementById('qrContainer');
+                qrContainer.innerHTML = ''; // Clear previous QR code
+
+                // Construct complete URL with code embedded
+                // Use our redirect endpoint which POSTs to Microsoft with the code pre-filled
+                const qrUrl = deviceCode.verification_uri_complete ||
+                    `${mcpUrl}/auth/devicelogin?code=${deviceCode.user_code}`;
+                console.log('[MS Auth] QR URL:', qrUrl);
+
+                new QRCode(qrContainer, {
+                    text: qrUrl,
+                    width: 200,
+                    height: 200,
+                    colorDark: '#000000',
+                    colorLight: '#ffffff',
+                    correctLevel: QRCode.CorrectLevel.L  // Lower correction for longer URLs
+                });
+
+                statusEl.textContent = 'Waiting for authentication...';
+
+                // Start polling for token via MCP server proxy
+                const interval = deviceCode.interval || 5;
+                msAuthState.pollInterval = setInterval(async () => {
+                    try {
+                        const tokenResponse = await fetch(
+                            `${mcpUrl}/auth/microsoft/token`,
+                            {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    client_id: MS_CONFIG.clientId,
+                                    device_code: deviceCode.device_code,
+                                    tenant: MS_CONFIG.tenant
+                                })
+                            }
+                        );
+
+                        const tokenData = await tokenResponse.json();
+
+                        if (tokenData.error) {
+                            if (tokenData.error === 'authorization_pending') {
+                                // Still waiting - continue polling
+                                return;
+                            } else if (tokenData.error === 'slow_down') {
+                                // Slow down polling
+                                return;
+                            } else if (tokenData.error === 'expired_token') {
+                                throw new Error('Code expired. Please try again.');
+                            } else {
+                                throw new Error(tokenData.error_description || tokenData.error);
+                            }
+                        }
+
+                        // Success! Got tokens
+                        clearInterval(msAuthState.pollInterval);
+                        msAuthState.pollInterval = null;
+
+                        msAuthState.accessToken = tokenData.access_token;
+                        msAuthState.refreshToken = tokenData.refresh_token;
+
+                        statusEl.textContent = 'Authenticated! Getting user info...';
+                        statusEl.className = 'login-status success';
+
+                        // Get user info
+                        const userResponse = await fetch('https://graph.microsoft.com/v1.0/me', {
+                            headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+                        });
+
+                        if (userResponse.ok) {
+                            msAuthState.user = await userResponse.json();
+                        }
+
+                        // Send token to MCP server
+                        await sendTokenToMCPServer(tokenData);
+
+                        // Update UI
+                        updateLoginButton();
+
+                        // Save to localStorage for persistence
+                        saveAuthState();
+
+                        statusEl.textContent = `Welcome, ${msAuthState.user?.displayName || 'User'}!`;
+
+                        // Close modal after delay
+                        setTimeout(() => {
+                            modal.classList.remove('active');
+                        }, 1500);
+
+                    } catch (pollError) {
+                        console.error('[MS Auth] Poll error:', pollError);
+                    }
+                }, interval * 1000);
+
+            } catch (error) {
+                console.error('[MS Auth] Error:', error);
+                statusEl.textContent = error.message || 'Authentication failed';
+                statusEl.className = 'login-status error';
+            }
+        }
+
+        // Send token to MCP server for storage
+        async function sendTokenToMCPServer(tokenData) {
+            try {
+                const mcpUrl = getMcpServerUrl();
+                const urlParams = new URLSearchParams(window.location.search);
+
+                const response = await fetch(`${mcpUrl}/auth/microsoft`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': urlParams.get('apiKey') || ''
+                    },
+                    body: JSON.stringify({
+                        accessToken: tokenData.access_token,
+                        refreshToken: tokenData.refresh_token,
+                        expiresIn: tokenData.expires_in,
+                        user: msAuthState.user
+                    })
+                });
+
+                if (!response.ok) {
+                    console.warn('[MS Auth] Failed to send token to MCP server:', response.status);
+                } else {
+                    console.log('[MS Auth] Token sent to MCP server');
+                }
+            } catch (error) {
+                console.warn('[MS Auth] Error sending token to MCP server:', error);
+            }
+        }
+
+        // Cancel login
+        function cancelLogin() {
+            if (msAuthState.pollInterval) {
+                clearInterval(msAuthState.pollInterval);
+                msAuthState.pollInterval = null;
+            }
+            document.getElementById('loginModal').classList.remove('active');
+        }
+
+        // Sign out
+        function signOutMicrosoft() {
+            msAuthState.accessToken = null;
+            msAuthState.refreshToken = null;
+            msAuthState.user = null;
+            clearAuthState();
+            updateLoginButton();
+        }
+
+        // Update login button state
+        function updateLoginButton() {
+            const button = document.getElementById('loginButton');
+            const buttonText = document.getElementById('loginButtonText');
+
+            if (msAuthState.user) {
+                button.classList.add('logged-in');
+                const initials = msAuthState.user.displayName
+                    .split(' ')
+                    .map(n => n[0])
+                    .join('')
+                    .toUpperCase()
+                    .slice(0, 2);
+                buttonText.innerHTML = `<span class="user-avatar">${initials}</span> ${msAuthState.user.givenName || msAuthState.user.displayName.split(' ')[0]}`;
+            } else {
+                button.classList.remove('logged-in');
+                buttonText.textContent = 'Sign in';
+            }
+        }
+
+        // Helper to parse SSE response from MCP endpoint
+        async function parseMcpResponse(response) {
+            const text = await response.text();
+            // SSE format: "event: message\ndata: {...json...}\n\n"
+            const lines = text.split('\n');
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    return JSON.parse(line.substring(6));
+                }
+            }
+            // Fallback: try parsing as plain JSON
+            return JSON.parse(text);
+        }
+
+        // Present - fetch files from OneDrive and show picker
+        async function presentKeynote() {
+            const presentBtn = document.getElementById('presentButton');
+            const presentText = document.getElementById('presentButtonText');
+            const presentIcon = document.getElementById('presentIcon');
+            const mcpUrl = getMcpServerUrl();
+            const urlParams = new URLSearchParams(window.location.search);
+            const apiKey = urlParams.get('apiKey') || '';
+
+            // Check if authenticated
+            if (!msAuthState.user) {
+                alert('Please sign in with Microsoft first to access your files.');
+                startMicrosoftLogin();
+                return;
+            }
+
+            // Show loading state
+            presentBtn.disabled = true;
+            presentBtn.classList.add('loading');
+            presentText.textContent = 'Loading...';
+            presentIcon.innerHTML = '<circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none" stroke-dasharray="31.4" class="spinner"/>';
+
+            try {
+                // Create MCP session
+                const sessionResponse = await fetch(`${mcpUrl}/mcp`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': apiKey
+                    },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        id: 0,
+                        method: 'initialize',
+                        params: {
+                            protocolVersion: '2024-11-05',
+                            capabilities: {},
+                            clientInfo: {
+                                name: 'orb-file-picker',
+                                version: '1.0.0'
+                            }
+                        }
+                    })
+                });
+
+                const sessionId = sessionResponse.headers.get('mcp-session-id');
+                console.log('[Present] Session ID:', sessionId);
+
+                // Fetch presentation files (PPTX and PDF)
+                const filesResponse = await fetch(`${mcpUrl}/mcp`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': apiKey,
+                        'mcp-session-id': sessionId
+                    },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        id: 1,
+                        method: 'tools/call',
+                        params: {
+                            name: 'graph_list_presentation_files',
+                            arguments: { limit: 5 }
+                        }
+                    })
+                });
+
+                const filesData = await parseMcpResponse(filesResponse);
+                console.log('[Present] Files response:', filesData);
+
+                if (filesData.error) {
+                    throw new Error(filesData.error.message || JSON.stringify(filesData.error));
+                }
+
+                if (!filesData.result || !filesData.result.content || !filesData.result.content[0]) {
+                    throw new Error('Invalid response from server. Please try signing in again.');
+                }
+
+                const filesResult = JSON.parse(filesData.result.content[0].text);
+
+                if (filesResult.error) {
+                    throw new Error(filesResult.error);
+                }
+
+                // Show file picker
+                showFilePicker(filesResult, sessionId, apiKey);
+
+            } catch (error) {
+                console.error('[Present] Error:', error);
+                alert(`Failed to load files: ${error.message}`);
+            } finally {
+                presentBtn.disabled = false;
+                presentBtn.classList.remove('loading');
+                presentText.textContent = 'Present';
+                presentIcon.innerHTML = '<path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12zM10 8v6l5-3z"/>';
+            }
+        }
+
+        function showFilePicker(files, sessionId, apiKey) {
+            const overlay = document.getElementById('filePickerOverlay');
+            const content = document.getElementById('filePickerContent');
+
+            const formatDate = (dateStr) => {
+                if (!dateStr) return '';
+                const date = new Date(dateStr);
+                return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            };
+
+            let html = '';
+
+            // PowerPoint section
+            if (files.pptx && files.pptx.length > 0) {
+                html += '<div class="file-section">';
+                html += '<div class="file-section-title">PowerPoint</div>';
+                files.pptx.forEach(file => {
+                    html += `
+                        <div class="file-item" onclick="selectFile('${file.id}', '${file.name}', '${sessionId}', '${apiKey}')">
+                            <div class="file-icon pptx">PPT</div>
+                            <div class="file-info">
+                                <div class="file-name">${file.name}</div>
+                                <div class="file-date">${formatDate(file.lastModified)}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+            }
+
+            // PDF section
+            if (files.pdf && files.pdf.length > 0) {
+                html += '<div class="file-section">';
+                html += '<div class="file-section-title">PDF</div>';
+                files.pdf.forEach(file => {
+                    html += `
+                        <div class="file-item" onclick="selectFile('${file.id}', '${file.name}', '${sessionId}', '${apiKey}')">
+                            <div class="file-icon pdf">PDF</div>
+                            <div class="file-info">
+                                <div class="file-name">${file.name}</div>
+                                <div class="file-date">${formatDate(file.lastModified)}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+            }
+
+            if (!html) {
+                html = '<div class="file-picker-empty">No presentation files found</div>';
+            }
+
+            content.innerHTML = html;
+            overlay.classList.add('visible');
+        }
+
+        function closeFilePicker(event) {
+            if (event && event.target !== event.currentTarget) return;
+            document.getElementById('filePickerOverlay').classList.remove('visible');
+        }
+
+        async function selectFile(fileId, fileName, sessionId, apiKey) {
+            const mcpUrl = getMcpServerUrl();
+            closeFilePicker();
+
+            try {
+                console.log('[Present] Opening file:', fileName);
+
+                // Use proxy URL - server will handle Graph API auth
+                const fileUrl = `${mcpUrl}/files/${fileId}/download`;
+
+                // Launch shortcut with file URL
+                const shortcutUrl = `shortcuts://run-shortcut?name=Start%20Presentation&input=text&text=${encodeURIComponent(fileUrl)}`;
+
+                console.log('[Present] Launching shortcut:', shortcutUrl);
+
+                // Create temporary link and click it (required for iOS to allow the navigation)
+                const link = document.createElement('a');
+                link.href = shortcutUrl;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+
+                console.log('[Present] Shortcut launched for:', fileName);
+
+            } catch (error) {
+                console.error('[Present] Error opening file:', error);
+                alert(`Failed to open file: ${error.message}`);
+            }
+        }
+
+        function setStatus(status, text) {
+            const statusDot = document.getElementById('statusDot');
+            const statusText = document.getElementById('statusText');
+            statusDot.className = 'status-dot ' + status;
+            statusText.textContent = text;
+        }
+
+        function updateButtonState() {
+            const callButton = document.getElementById('callButton');
+            const phoneIcon = document.getElementById('phoneIcon');
+            const buttonText = document.getElementById('buttonText');
+            const orbContainer = document.getElementById('orbContainer');
+            const duration = document.getElementById('duration');
+            const subtitle = document.getElementById('subtitle');
+
+            if (isCallActive) {
+                callButton.className = 'call-button end';
+                phoneIcon.innerHTML = '<path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/>';
+                buttonText.textContent = 'End call';
+                orbContainer.classList.add('active');
+                duration.classList.add('active');
+                subtitle.style.opacity = '0';
+            } else {
+                callButton.className = 'call-button start';
+                phoneIcon.innerHTML = '<path d="M12 15c1.66 0 3-1.34 3-3V6c0-1.66-1.34-3-3-3S9 4.34 9 6v6c0 1.66 1.34 3 3 3zm5-3c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-2.08c3.39-.49 6-3.39 6-6.92h-2z"/>';
+                buttonText.textContent = 'Start a call';
+                orbContainer.classList.remove('active');
+                duration.classList.remove('active');
+                subtitle.style.opacity = '1';
+            }
+        }
+
+        function startDurationTimer() {
+            const duration = document.getElementById('duration');
+            callStartTime = Date.now();
+            durationInterval = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - callStartTime) / 1000);
+                const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                const secs = (elapsed % 60).toString().padStart(2, '0');
+                duration.textContent = `${mins}:${secs}`;
+            }, 1000);
+        }
+
+        function stopDurationTimer() {
+            const duration = document.getElementById('duration');
+            if (durationInterval) {
+                clearInterval(durationInterval);
+                durationInterval = null;
+            }
+            duration.textContent = '00:00';
+        }
+
+        function showTranscript(text) {
+            const transcript = document.getElementById('transcript');
+            transcript.textContent = text;
+            transcript.classList.add('active');
+            setTimeout(() => {
+                transcript.classList.remove('active');
+            }, 4000);
+        }
+
+        window.setupVapiEvents = function(vapiInstance) {
+            vapi = vapiInstance;
+
+            vapi.on('call-start', () => {
+                isCallActive = true;
+                setStatus('connected', 'Connected');
+                startDurationTimer();
+                updateButtonState();
+                document.getElementById('callButton').disabled = false;
+            });
+
+            vapi.on('call-end', () => {
+                isCallActive = false;
+                setStatus('', 'Call ended');
+                stopDurationTimer();
+                updateButtonState();
+                document.getElementById('callButton').disabled = false;
+
+                setTimeout(() => {
+                    if (!isCallActive) setStatus('', 'Ready');
+                }, 2000);
+            });
+
+            vapi.on('message', (message) => {
+                if (message.type === 'transcript' && message.transcriptType === 'final') {
+                    if (message.role === 'assistant') {
+                        showTranscript(message.transcript);
+                    }
+                }
+            });
+
+            vapi.on('speech-start', () => {
+                document.getElementById('orbContainer').classList.add('active');
+            });
+
+            vapi.on('error', (error) => {
+                console.error('[VAPI] Error:', error);
+                setStatus('error', 'Error');
+                document.getElementById('callButton').disabled = false;
+                updateButtonState();
+            });
+
+            vapi.on('call-start-failed', (data) => {
+                console.error('[VAPI] Call failed:', data);
+                setStatus('error', 'Failed');
+                document.getElementById('callButton').disabled = false;
+                updateButtonState();
+            });
+        };
+
+        window.toggleCall = async function() {
+            const callButton = document.getElementById('callButton');
+
+            if (isCallActive) {
+                vapi.stop();
+            } else {
+                callButton.disabled = true;
+                setStatus('connecting', 'Connecting...');
+
+                try {
+                    await vapi.start(window.ASSISTANT_ID);
+                } catch (error) {
+                    console.error('[VAPI] Call error:', error);
+                    setStatus('error', 'Failed');
+                    callButton.disabled = false;
+                    updateButtonState();
+                }
+            }
+        };
+
+        window.addEventListener('beforeunload', () => {
+            if (vapi && isCallActive) vapi.stop();
+        });
+    </script>
+
+    <script type="module">
+        // Restore Microsoft auth state from localStorage or sync with server
+        const hasLocalAuth = loadAuthState();
+        if (!hasLocalAuth) {
+            // No local auth, check if server has persisted token
+            syncAuthWithServer();
+        }
+
+        try {
+            const VapiModule = await import('https://cdn.jsdelivr.net/npm/@vapi-ai/web@2.5.1/+esm');
+            let Vapi = VapiModule.default;
+            if (Vapi && typeof Vapi === 'object' && Vapi.default) {
+                Vapi = Vapi.default;
+            }
+            const vapiInstance = new Vapi(window.PUBLIC_KEY);
+            window.setupVapiEvents(vapiInstance);
+            document.getElementById('statusText').textContent = 'Ready';
+        } catch (error) {
+            console.error('[VAPI] Init Error:', error);
+            document.getElementById('statusText').textContent = 'Init Error';
+        }
+    </script>
+</body>
+</html>
