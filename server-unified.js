@@ -412,28 +412,40 @@ async function authMiddleware(req, res, next) {
     return next();
   }
 
-  // Check for OAuth Bearer token first
+  // Check for Bearer token (API key or OAuth)
   const authHeader = req.headers['authorization'];
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    if (!SECURITY.oauth.enabled) {
-      return res.status(401).json({ error: 'OAuth not enabled' });
+    const token = authHeader.substring(7);
+
+    // First check if it's a valid API key (VAPI sends server secret as Bearer token)
+    if (SECURITY.apiKeys.has(token)) {
+      req.auth = { type: 'apikey', tier: SECURITY.apiKeys.get(token) };
+      req.apiKeyTier = req.auth.tier;
+      logger.debug({ tier: req.auth.tier }, 'Bearer token matched API key (VAPI compatible)');
+      return next();
     }
 
-    const token = authHeader.substring(7);
-    try {
-      const decoded = await validateOAuthToken(token);
-      req.auth = {
-        type: 'oauth',
-        user: decoded,
-        tier: decoded.tier || decoded.scope?.includes('premium') ? 'premium' : 'basic'
-      };
-      logger.debug({ sub: decoded.sub }, 'OAuth token validated');
-      return next();
-    } catch (err) {
-      metrics.errorCount++;
-      logger.warn({ error: err.message }, 'OAuth token validation failed');
-      return res.status(401).json({ error: 'Invalid or expired token' });
+    // Try OAuth validation if enabled
+    if (SECURITY.oauth.enabled) {
+      try {
+        const decoded = await validateOAuthToken(token);
+        req.auth = {
+          type: 'oauth',
+          user: decoded,
+          tier: decoded.tier || decoded.scope?.includes('premium') ? 'premium' : 'basic'
+        };
+        logger.debug({ sub: decoded.sub }, 'OAuth token validated');
+        return next();
+      } catch (err) {
+        metrics.errorCount++;
+        logger.warn({ error: err.message }, 'OAuth token validation failed');
+        return res.status(401).json({ error: 'Invalid or expired token' });
+      }
     }
+
+    // Bearer token didn't match API key and OAuth not enabled
+    metrics.errorCount++;
+    return res.status(401).json({ error: 'Invalid Bearer token - not a valid API key or OAuth token' });
   }
 
   // Fall back to API key authentication
