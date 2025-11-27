@@ -58,8 +58,8 @@ class WebSocketManager {
       lastPingSent: 0,
       lastPongReceived: 0,
       missedPongs: 0,
-      maxMissedPongs: 3,       // Reconnect after 3 missed pongs (75s without response)
-      pongTimeout: 30000       // Consider pong missed if not received within 30s
+      maxMissedPongs: 5,       // Reconnect after 5 missed pongs (~225s without response)
+      pongTimeout: 45000       // Consider pong missed if not received within 45s
     };
 
     // Connection monitor interval reference

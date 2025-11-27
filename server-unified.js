@@ -17,10 +17,13 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import http from 'http';
 import https from 'https';
 import { Readable } from 'stream';
 import jwt from 'jsonwebtoken';
 import jwksRsa from 'jwks-rsa';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 
 // Shared modules
 import wsManager from './shared/clientWebSocketForV2.js';
@@ -120,6 +123,92 @@ if (SECURITY.oauth.enabled && SECURITY.oauth.jwksUri) {
     jwksRequestsPerMinute: 10
   });
   logger.info({ jwksUri: SECURITY.oauth.jwksUri }, 'OAuth JWKS client initialized');
+}
+
+// Initialize Gemini AI (lazy - only when needed)
+let genAI = null;
+function getGeminiModel() {
+  if (!genAI && process.env.GEMINI_API_KEY) {
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  }
+  return genAI?.getGenerativeModel({ model: 'gemini-2.0-flash' });
+}
+
+// Grab a single frame from an MJPEG stream
+async function grabMjpegFrame(url) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const isHttps = parsedUrl.protocol === 'https:';
+    const httpModule = isHttps ? https : http;
+
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (isHttps ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      timeout: 10000
+    };
+
+    // Use SOCKS proxy if Tailscale is configured
+    if (process.env.TAILSCALE_AUTHKEY) {
+      const proxyUrl = process.env.TAILSCALE_SOCKS_PROXY || 'socks5://127.0.0.1:1055';
+      options.agent = new SocksProxyAgent(proxyUrl);
+    }
+
+    const req = httpModule.request(options, (res) => {
+      let buffer = Buffer.alloc(0);
+      let foundStart = false;
+      let frameComplete = false;
+
+      res.on('data', chunk => {
+        if (frameComplete) return;
+
+        buffer = Buffer.concat([buffer, chunk]);
+
+        // Look for JPEG markers: SOI (FF D8), EOI (FF D9)
+        if (!foundStart) {
+          const soiIndex = buffer.indexOf(Buffer.from([0xFF, 0xD8]));
+          if (soiIndex !== -1) {
+            buffer = buffer.slice(soiIndex);
+            foundStart = true;
+          }
+        }
+
+        if (foundStart) {
+          const eoiIndex = buffer.indexOf(Buffer.from([0xFF, 0xD9]));
+          if (eoiIndex !== -1) {
+            const frame = buffer.slice(0, eoiIndex + 2);
+            frameComplete = true;
+            req.destroy();
+            resolve({
+              ok: true,
+              status: 200,
+              arrayBuffer: async () => frame
+            });
+          }
+        }
+
+        // Safety limit
+        if (buffer.length > 5 * 1024 * 1024) {
+          req.destroy();
+          reject(new Error('Frame too large'));
+        }
+      });
+
+      res.on('end', () => {
+        if (!frameComplete) {
+          reject(new Error('Stream ended without complete frame'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Stream timeout'));
+    });
+    req.end();
+  });
 }
 
 // Helper to get signing key from JWKS
@@ -304,7 +393,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   metrics.toolCalls.set(name, (metrics.toolCalls.get(name) || 0) + 1);
 
   try {
-    const result = await executeTool(name, args, { transport: 'mcp' });
+    const result = await executeTool(name, args, {
+      transport: 'mcp',
+      geminiModel: getGeminiModel(),
+      grabMjpegFrame
+    });
     return formatMcpResult(result);
   } catch (e) {
     metrics.errorCount++;
@@ -482,6 +575,21 @@ app.get('/ready', (req, res) => wsManager.isConnected && wsManager.isIdentified
   ? res.json({ ready: true })
   : res.status(503).json({ ready: false }));
 app.get('/live', (req, res) => res.json({ alive: true }));
+
+// Debug endpoint - expose raw state for troubleshooting
+app.get('/debug/state', authMiddleware, async (req, res) => {
+  try {
+    const state = await wsManager.getState();
+    res.json({
+      state,
+      components: wsManager.components,
+      discoveredComponents: Object.keys(wsManager.discoveredComponents.list),
+      controllerStatus: wsManager.controllerStatus
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // Metrics endpoint - Full parity with server-http.js
 app.get('/metrics', (req, res) => {
@@ -826,10 +934,23 @@ app.post('/voice/webhook', authMiddleware, async (req, res) => {
     const toolName = call.name || call.function?.name;
     const toolId = call.id;
     const rawArgs = call.arguments || call.function?.arguments || {};
-    const args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+
+    // Safely parse arguments - malformed JSON shouldn't crash the webhook
+    let args;
+    try {
+      args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+    } catch (parseError) {
+      logger.error({ tool: toolName, rawArgs, error: parseError.message }, 'Failed to parse tool arguments');
+      results.push({ toolCallId: toolId, error: 'Invalid arguments format' });
+      continue;
+    }
 
     try {
-      const result = await executeTool(toolName, args, { transport: 'voice' });
+      const result = await executeTool(toolName, args, {
+        transport: 'voice',
+        geminiModel: getGeminiModel(),
+        grabMjpegFrame
+      });
       results.push({ toolCallId: toolId, result });
       logger.info({ tool: toolName, result }, 'Tool executed');
     } catch (error) {
@@ -852,6 +973,16 @@ app.get('/voice/health', (req, res) => {
     status: wsManager.isConnected && wsManager.isIdentified ? 'healthy' : 'degraded',
     connected: wsManager.isConnected,
     identified: wsManager.isIdentified
+  });
+});
+
+// GET handler for webhook - VAPI may check this before POSTing
+app.get('/voice/webhook', (req, res) => {
+  res.json({
+    endpoint: '/voice/webhook',
+    method: 'POST',
+    status: 'ready',
+    message: 'Use POST to submit tool calls'
   });
 });
 
@@ -962,7 +1093,7 @@ async function main() {
     logger.error({ maxRetries }, 'WebSocket init failed after all retries - will rely on manual reconnect');
   }
 
-  connectWithRetry();
+  await connectWithRetry();
 
   // Periodic health check - reconnect if disconnected
   setInterval(() => {
