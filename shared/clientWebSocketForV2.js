@@ -10,6 +10,7 @@ import pino from 'pino';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import net from 'net';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -26,6 +27,45 @@ const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   base: { service: 'bucontrol-ws-client' }
 });
+
+/**
+ * Check if SOCKS5 proxy is reachable
+ * @param {string} host - Proxy host (default: 127.0.0.1)
+ * @param {number} port - Proxy port (default: 1055)
+ * @param {number} timeout - Connection timeout in ms (default: 3000)
+ * @returns {Promise<{reachable: boolean, latency?: number, error?: string}>}
+ */
+async function checkSocksProxy(host = '127.0.0.1', port = 1055, timeout = 3000) {
+  const startTime = Date.now();
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+
+    const cleanup = () => {
+      socket.removeAllListeners();
+      socket.destroy();
+    };
+
+    socket.setTimeout(timeout);
+
+    socket.on('connect', () => {
+      const latency = Date.now() - startTime;
+      cleanup();
+      resolve({ reachable: true, latency });
+    });
+
+    socket.on('timeout', () => {
+      cleanup();
+      resolve({ reachable: false, error: 'Connection timeout' });
+    });
+
+    socket.on('error', (err) => {
+      cleanup();
+      resolve({ reachable: false, error: err.message });
+    });
+
+    socket.connect(port, host);
+  });
+}
 
 class WebSocketManager {
   constructor() {
@@ -52,8 +92,8 @@ class WebSocketManager {
     };
 
     // Connection health monitoring
-    // Server sends ping every 25s and expects pong within 60s
-    // Server disconnects client if no ping received for 90s
+    // Server sends ping every 45s and expects pong within 120s
+    // Server disconnects client if no pong received for ~165s
     this.connectionHealth = {
       lastPingSent: 0,
       lastPongReceived: 0,
@@ -118,31 +158,44 @@ class WebSocketManager {
     this.config = config;
     const url = `http://${config.websocketHost}:${config.websocketPort}`;
 
+    logger.info({ url }, 'Connecting to WebSocket bridge V2');
+
+    const socketOptions = {
+      transports: ['websocket'],
+      reconnection: true,
+      reconnectionDelay: config.reconnectionDelayBase || 1000,
+      reconnectionDelayMax: config.reconnectionDelayMax || 5000,
+      reconnectionAttempts: config.reconnectionAttempts || Infinity,
+      timeout: config.connectionTimeout || 20000
+    };
+
+    // Add authentication token if configured
+    if (config.authToken) {
+      socketOptions.auth = { token: config.authToken };
+      logger.info('Using authentication token');
+    }
+
+    // Use SOCKS5 proxy for Tailscale
+    if (process.env.TAILSCALE_AUTHKEY) {
+      const proxyUrl = process.env.TAILSCALE_SOCKS_PROXY || 'socks5://127.0.0.1:1055';
+
+      // Parse proxy URL to get host and port for connectivity check
+      const proxyMatch = proxyUrl.match(/socks5?:\/\/([^:]+):(\d+)/);
+      const proxyHost = proxyMatch?.[1] || '127.0.0.1';
+      const proxyPort = parseInt(proxyMatch?.[2] || '1055');
+
+      // Check SOCKS5 proxy connectivity before using it
+      const proxyCheck = await checkSocksProxy(proxyHost, proxyPort, 5000);
+      if (proxyCheck.reachable) {
+        logger.info({ proxyUrl, latency: proxyCheck.latency }, 'SOCKS5 proxy is reachable');
+      } else {
+        logger.error({ proxyUrl, error: proxyCheck.error }, 'SOCKS5 proxy is NOT reachable - connection may fail');
+      }
+      // Always set the proxy agent - Tailscale might be starting up
+      socketOptions.agent = new SocksProxyAgent(proxyUrl);
+    }
+
     return new Promise((resolve, reject) => {
-      logger.info({ url }, 'Connecting to WebSocket bridge V2');
-
-      const socketOptions = {
-        transports: ['websocket'],
-        reconnection: true,
-        reconnectionDelay: config.reconnectionDelayBase || 1000,
-        reconnectionDelayMax: config.reconnectionDelayMax || 5000,
-        reconnectionAttempts: config.reconnectionAttempts || Infinity,
-        timeout: config.connectionTimeout || 20000
-      };
-
-      // Add authentication token if configured
-      if (config.authToken) {
-        socketOptions.auth = { token: config.authToken };
-        logger.info('Using authentication token');
-      }
-
-      // Use SOCKS5 proxy for Tailscale
-      if (process.env.TAILSCALE_AUTHKEY) {
-        const proxyUrl = process.env.TAILSCALE_SOCKS_PROXY || 'socks5://127.0.0.1:1055';
-        logger.info({ proxyUrl }, 'Using Tailscale SOCKS5 proxy');
-        socketOptions.agent = new SocksProxyAgent(proxyUrl);
-      }
-
       this.socket = io(url, socketOptions);
 
       const timeout = setTimeout(() => {
@@ -280,12 +333,13 @@ class WebSocketManager {
       });
 
       // Heartbeat to keep SOCKS proxy connection alive (ping only, no redundant subscribe)
+      // 20s interval is optimal for Tailscale SOCKS proxy (keeps connection alive through DERP relays)
       this.heartbeatInterval = setInterval(() => {
         if (this.isConnected && this.socket) {
           this.connectionHealth.lastPingSent = Date.now();
           this.socket.emit('ping', { timestamp: Date.now() });
         }
-      }, 25000);
+      }, 20000);
 
       // Connection health monitor - check for stale connections
       this.connectionMonitorInterval = setInterval(() => {
@@ -443,6 +497,9 @@ class WebSocketManager {
       try {
         this.state.connectedSources = JSON.parse(control.string || control.value).sources;
       } catch (e) {}
+    } else if (controlId === 'HardwareState') {
+      // HardwareState contains WindowCommand string in .string, not .value
+      this.state.hardwareState = control.string || control.value;
     } else if (map[controlId]) {
       this.state[map[controlId]] = control.value;
     }
@@ -455,7 +512,7 @@ class WebSocketManager {
     const c = data.component?.controls;
     if (!c) return;
 
-    if (c.HardwareState) this.state.hardwareState = c.HardwareState.value;
+    if (c.HardwareState) this.state.hardwareState = c.HardwareState.string || c.HardwareState.value;
     if (c.ConnectedSources) {
       try {
         this.state.connectedSources = JSON.parse(c.ConnectedSources.string || c.ConnectedSources.value).sources;
@@ -505,6 +562,11 @@ class WebSocketManager {
    * Get current state (refresh if stale)
    */
   async getState() {
+    // Guard: ensure socket is connected before emitting
+    if (!this.isConnected || !this.socket) {
+      throw new Error('Not connected');
+    }
+
     if (Date.now() - this.state.timestamp > this.state.TTL) {
       this.socket.emit('controller:subscribe', {
         controllerId: this.config.controllerId
@@ -667,10 +729,6 @@ class WebSocketManager {
     }
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Control subscribe timeout'));
-      }, this.config?.commandTimeout || 10000);
-
       // Listen for control update response
       const onUpdate = (data) => {
         if (data.componentId === componentId && data.controlId === controlId) {
@@ -687,6 +745,12 @@ class WebSocketManager {
           resolve(data.control || data);
         }
       };
+
+      const timeout = setTimeout(() => {
+        // Clean up listener to prevent memory leak
+        this.socket.off('control:update', onUpdate);
+        reject(new Error('Control subscribe timeout'));
+      }, this.config?.commandTimeout || 10000);
 
       this.socket.on('control:update', onUpdate);
 

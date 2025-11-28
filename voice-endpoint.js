@@ -363,9 +363,9 @@ class VoiceEndpoint {
           }
         });
 
-        // Watch components
+        // Subscribe to components
         Object.values(this.components).filter(Boolean).forEach(id => {
-          this.socket.emit('component:watch', {
+          this.socket.emit('component:subscribe', {
             controllerId: this.config.controllerId,
             componentId: id
           });

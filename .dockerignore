@@ -1,0 +1,34 @@
+# Exclude from Docker build
+node_modules/
+.git/
+.github/
+
+# Documentation
+*.md
+LICENSE
+
+# Local dev files
+.env
+.env.*
+.clever.json
+.ms-graph-token.json
+
+# Backup files
+.backup/
+*.bak
+*.BACKUP*
+
+# Local scripts
+setup.bat
+setup.sh
+start-secure.bat
+
+# Old deployment configs
+render.yaml
+
+# Windows artifacts
+nul
+
+# Test files
+tests/
+*.test.js

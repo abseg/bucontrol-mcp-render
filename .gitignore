@@ -30,4 +30,9 @@ build/
 # Backup files
 *.backup
 *.bak
+.backup/
 .env.clever
+
+# Token files - NEVER COMMIT
+.ms-graph-token.json
+*.token.json

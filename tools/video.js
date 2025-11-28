@@ -236,9 +236,104 @@ export const videoTools = [
   },
 
   {
+    name: 'describe_source',
+    description: 'Analyze what is currently on screen or a specific source using AI vision (Gemini). Defaults to the currently displayed source.',
+    voiceDescription: 'Describe what is on screen or a specific source. Use when user asks "What\'s on the screen?", "What am I looking at?", "Describe what\'s showing". Defaults to current screen.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          oneOf: [
+            { type: 'string', enum: ['screen'], description: 'Analyze currently displayed source (default)' },
+            { type: 'number', description: 'Specific source 1-4: 1=Laptop, 2=ClickShare, 3=AppleTV, 4=Conference' }
+          ],
+          description: 'What to analyze: "screen" (default) for current display, or source number 1-4'
+        }
+      }
+    },
+    handler: async (args, ctx) => {
+      if (!ctx.geminiModel) {
+        throw new Error('Vision not available. Set GEMINI_API_KEY.');
+      }
+
+      const state = await ctx.ws.getState();
+      const sources = state.connectedSources || [];
+
+      if (sources.length === 0) {
+        return { description: null, message: 'No sources detected.' };
+      }
+
+      // Determine which source to analyze
+      let sourceIndex;
+      const target = args.target || 'screen';
+
+      if (target === 'screen' || target === undefined) {
+        // Get currently displayed source from hardwareState
+        const currentSource = parseCurrentSource(state.hardwareState);
+        if (!currentSource) {
+          return { description: null, message: 'Screen is off or no source displayed.' };
+        }
+        sourceIndex = currentSource - 1;
+      } else if (typeof target === 'number') {
+        if (target < 1 || target > 4) {
+          throw new Error('Invalid source. Use 1-4 or "screen".');
+        }
+        sourceIndex = target - 1;
+      } else {
+        throw new Error('Invalid target. Use "screen" or source number 1-4.');
+      }
+
+      const source = sources[sourceIndex];
+      const sourceName = SOURCE_NAMES[sourceIndex + 1];
+
+      if (!source || !source.connected) {
+        return { description: null, message: `${sourceName} is not connected.` };
+      }
+
+      if (!source.proxiedPreviewUrl) {
+        return { description: null, message: `${sourceName} has no preview available.` };
+      }
+
+      // Analyze with Gemini
+      try {
+        const frame = await ctx.grabMjpegFrame(source.proxiedPreviewUrl);
+        const base64 = Buffer.from(await frame.arrayBuffer()).toString('base64');
+
+        const result = await ctx.geminiModel.generateContent([
+          'Describe what is shown on this screen in 15 words or less. Focus on: presentation type, video call, desktop, video content, app name. Be concise and natural.',
+          { inlineData: { mimeType: 'image/jpeg', data: base64 } }
+        ]);
+
+        return {
+          source: sourceIndex + 1,
+          name: sourceName,
+          description: result.response.text().trim(),
+          isCurrentScreen: target === 'screen' || target === undefined
+        };
+      } catch (error) {
+        return {
+          source: sourceIndex + 1,
+          name: sourceName,
+          description: null,
+          error: 'Analysis failed: ' + error.message
+        };
+      }
+    },
+    formatVoice: (result) => {
+      if (result.message) return result.message;
+      if (result.error) return `${result.name}: ${result.error}`;
+      if (result.isCurrentScreen) {
+        return `The screen is showing ${result.description}`;
+      }
+      return `${result.name}: ${result.description}`;
+    }
+  },
+
+  {
     name: 'describe_sources',
-    description: 'Analyze what each source is showing using AI vision (Gemini)',
-    voiceDescription: 'Analyze what each source is showing using AI vision. Use when user asks "What\'s on the laptop?", "Is there a presentation?"',
+    aliases: ['describe_all_sources'],
+    description: 'Analyze ALL connected sources using AI vision (Gemini). Use describe_source for single source to save API calls.',
+    voiceDescription: 'Analyze ALL connected sources. Only use when user explicitly asks for all sources like "What\'s on all inputs?" or "Describe every source".',
     inputSchema: {
       type: 'object',
       properties: {

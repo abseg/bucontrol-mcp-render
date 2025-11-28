@@ -2,6 +2,7 @@
  * Unified Tool Registry
  * Single source of truth for all tools across MCP, Voice, and Stdio transports
  */
+import pRetry from 'p-retry';
 import wsManager from '../shared/clientWebSocketForV2.js';
 import { SOURCE_NAMES, SOURCE_IDS, VOLUME_MAP } from '../shared/constants.js';
 import { screenTools } from './screen.js';
@@ -78,7 +79,30 @@ export function getVapiToolDefinitions() {
 }
 
 /**
- * Execute a tool
+ * Wait for WebSocket connection to be ready (with timeout)
+ * Gracefully handles brief reconnection windows
+ */
+async function waitForConnection(timeoutMs = 5000) {
+  if (wsManager.isConnected && wsManager.isIdentified) {
+    return true;
+  }
+
+  const startTime = Date.now();
+  return new Promise((resolve) => {
+    const checkInterval = setInterval(() => {
+      if (wsManager.isConnected && wsManager.isIdentified) {
+        clearInterval(checkInterval);
+        resolve(true);
+      } else if (Date.now() - startTime >= timeoutMs) {
+        clearInterval(checkInterval);
+        resolve(false);
+      }
+    }, 250); // Check every 250ms
+  });
+}
+
+/**
+ * Execute a tool with retry logic for resilience
  * @param {string} name - Tool name
  * @param {object} args - Tool arguments
  * @param {object} ctx - Execution context { transport: 'mcp'|'voice'|'stdio', ... }
@@ -89,11 +113,53 @@ export async function executeTool(name, args = {}, ctx = {}) {
     throw new Error(`Unknown tool: ${name}`);
   }
 
-  // Execute handler
-  const result = await tool.handler(args, {
-    ws: wsManager,
-    ...ctx
-  });
+  // Wait for connection if not currently connected (handles brief reconnection windows)
+  if (!wsManager.isConnected || !wsManager.isIdentified) {
+    const connected = await waitForConnection(5000);
+    if (!connected) {
+      // Return graceful message for voice instead of throwing
+      if (ctx.transport === 'voice') {
+        return 'System is temporarily unavailable. Please try again in a moment.';
+      }
+      throw new Error('Not connected to control system');
+    }
+  }
+
+  // Execute with retry logic for transient failures (timeouts, etc.)
+  const result = await pRetry(
+    async () => {
+      // Re-check connection before each attempt
+      if (!wsManager.isConnected || !wsManager.isIdentified) {
+        const err = new Error('Connection lost during execution');
+        err.bailout = true; // Signal pRetry to stop retrying
+        throw err;
+      }
+
+      // Execute handler
+      return tool.handler(args, {
+        ws: wsManager,
+        ...ctx
+      });
+    },
+    {
+      retries: 3,
+      minTimeout: 1000,
+      maxTimeout: 5000,
+      shouldRetry: (error) => {
+        // Don't retry connection errors - they won't help
+        if (error.bailout || error.message.includes('Connection lost') ||
+            error.message.includes('Not connected')) {
+          return false;
+        }
+        return true;
+      },
+      onFailedAttempt: (error) => {
+        if (!error.bailout) {
+          console.warn(`[Tools] ${name} attempt ${error.attemptNumber} failed: ${error.message}`);
+        }
+      }
+    }
+  );
 
   // Format response based on transport
   if (ctx.transport === 'voice' && tool.formatVoice) {

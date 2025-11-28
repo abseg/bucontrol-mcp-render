@@ -402,44 +402,44 @@ function watchComponents() {
     }
   });
 
-  // Watch all discovered components
+  // Subscribe to all discovered components
   if (components.videoWall) {
-    socket.emit('component:watch', {
+    socket.emit('component:subscribe', {
       controllerId: CONFIG.controllerId,
       componentId: components.videoWall
     });
   }
 
   if (components.hdmiDisplay) {
-    socket.emit('component:watch', {
+    socket.emit('component:subscribe', {
       controllerId: CONFIG.controllerId,
       componentId: components.hdmiDisplay
     });
   }
 
   if (components.gpio) {
-    socket.emit('component:watch', {
+    socket.emit('component:subscribe', {
       controllerId: CONFIG.controllerId,
       componentId: components.gpio
     });
   }
 
   if (components.hdmiDecoder) {
-    socket.emit('component:watch', {
+    socket.emit('component:subscribe', {
       controllerId: CONFIG.controllerId,
       componentId: components.hdmiDecoder
     });
   }
 
   if (components.lighting) {
-    socket.emit('component:watch', {
+    socket.emit('component:subscribe', {
       controllerId: CONFIG.controllerId,
       componentId: components.lighting
     });
   }
 
   if (components.mixer) {
-    socket.emit('component:watch', {
+    socket.emit('component:subscribe', {
       controllerId: CONFIG.controllerId,
       componentId: components.mixer
     });
@@ -1171,8 +1171,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error(`Component not found: ${args.componentName}`);
         }
 
-        // Subscribe to component if not already watching
-        socket.emit('component:watch', {
+        // Subscribe to component if not already subscribed
+        socket.emit('component:subscribe', {
           controllerId: CONFIG.controllerId,
           componentId: component.id
         });

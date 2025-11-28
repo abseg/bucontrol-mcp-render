@@ -1,14 +1,15 @@
 {
   "name": "@bucontrol/mcp-server",
-  "version": "2.0.0",
-  "description": "MCP server for BUControl Video Wall - HTTP streaming edition for cloud deployment",
-  "main": "server-http.js",
+  "version": "2.1.0",
+  "description": "MCP server for BUControl Video Wall - Unified edition with shared tools and multiple transports",
+  "main": "server-unified.js",
   "type": "module",
   "scripts": {
-    "start": "node server-http.js",
+    "start": "node server-unified.js",
     "start:stdio": "node index.js",
-    "start:legacy": "node server.js",
-    "dev": "node --watch server-http.js",
+    "start:legacy": "node server-http.js",
+    "start:old": "node server.js",
+    "dev": "node --watch server-unified.js",
     "test": "node test-server.js",
     "health": "curl http://localhost:${PORT:-3100}/health"
   },
@@ -26,6 +27,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.22.0",
+    "p-retry": "^6.2.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.18.2",

@@ -18,16 +18,57 @@ import { randomUUID, createHash } from 'crypto';
 import jwt from 'jsonwebtoken';
 import jwksRsa from 'jwks-rsa';
 import { createVoiceRouter } from './voice-endpoint.js';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import https from 'https';
+import { Readable } from 'stream';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const TOKEN_FILE = join(__dirname, '.ms-graph-token.json');
 
 // Authorization codes storage for PKCE flow (code -> { client_id, redirect_uri, code_challenge, code_challenge_method, scope, expires })
 const authorizationCodes = new Map();
 
 // Microsoft Graph tokens storage (per room/session)
-// In production, consider Redis or database for persistence
 const msGraphTokens = {
   current: null, // { accessToken, refreshToken, expiresAt, user }
   history: []
 };
+
+// Load persisted token on startup
+function loadPersistedToken() {
+  try {
+    if (existsSync(TOKEN_FILE)) {
+      const data = JSON.parse(readFileSync(TOKEN_FILE, 'utf8'));
+      if (data.expiresAt && Date.now() < data.expiresAt) {
+        msGraphTokens.current = data;
+        console.log(`[MS Graph] Loaded persisted token for: ${data.user?.displayName}`);
+        return true;
+      } else {
+        console.log('[MS Graph] Persisted token expired');
+      }
+    }
+  } catch (e) {
+    console.error('[MS Graph] Failed to load persisted token:', e.message);
+  }
+  return false;
+}
+
+// Save token to file for persistence
+function savePersistedToken() {
+  try {
+    if (msGraphTokens.current) {
+      writeFileSync(TOKEN_FILE, JSON.stringify(msGraphTokens.current, null, 2));
+      console.log(`[MS Graph] Token persisted for: ${msGraphTokens.current.user?.displayName}`);
+    }
+  } catch (e) {
+    console.error('[MS Graph] Failed to persist token:', e.message);
+  }
+}
+
+// Load token on module init
+loadPersistedToken();
 
 dotenv.config();
 
@@ -256,7 +297,7 @@ function tryDiscoverComponents() {
         const found = entries.find(([, c]) => patterns.some(p => c.name.includes(p)));
         if (found) { components[key] = found[0]; logger.info({ component: key, id: found[0] }, 'Component found'); }
       });
-      Object.values(components).filter(Boolean).forEach(id => socket.emit('component:watch', { controllerId: CONFIG.controllerId, componentId: id }));
+      Object.values(components).filter(Boolean).forEach(id => socket.emit('component:subscribe', { controllerId: CONFIG.controllerId, componentId: id }));
       socket.on('component:state', (d) => {
         const c = d.component.controls; if (!c) return;
         if (c.HardwareState) controlState.hardwareState = c.HardwareState.value;
@@ -315,6 +356,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     { name: 'graph_get_user', description: 'Get signed-in Microsoft user info', inputSchema: { type: 'object', properties: {} } },
     { name: 'graph_list_recent_files', description: 'List user\'s recently accessed files from OneDrive/SharePoint', inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max files to return (default 10)' } } } },
     { name: 'graph_list_presentations', description: 'List user\'s PowerPoint presentations', inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max files to return (default 10)' } } } },
+    { name: 'graph_list_keynotes', description: 'List user\'s Keynote presentations (.key files)', inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max files to return (default 10)' } } } },
+    { name: 'graph_list_presentation_files', description: 'List user\'s presentation files (PPTX and PDF)', inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max files per type to return (default 5)' } } } },
     { name: 'graph_get_file_info', description: 'Get details about a specific file by ID', inputSchema: { type: 'object', properties: { fileId: { type: 'string' } }, required: ['fileId'] } },
     { name: 'graph_get_file_content_url', description: 'Get download/embed URL for a file', inputSchema: { type: 'object', properties: { fileId: { type: 'string' } }, required: ['fileId'] } }
   ]
@@ -361,18 +404,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const files = result.value.map(f => ({ id: f.id, name: f.name, webUrl: f.webUrl, lastModified: f.lastModifiedDateTime, size: f.size }));
         return { content: [{ type: 'text', text: JSON.stringify({ count: files.length, presentations: files }) }] };
       }
+      case 'graph_list_keynotes': {
+        const limit = args.limit || 10;
+        // Search for Keynote files across OneDrive AND SharePoint (fetch more to sort properly)
+        const result = await callGraphAPI(`/me/drive/root/search(q='.key')?$top=50`);
+        // Sort by lastModifiedDateTime descending (search endpoint ignores $orderby)
+        const keynoteFiles = result.value
+          .sort((a, b) => new Date(b.lastModifiedDateTime || 0) - new Date(a.lastModifiedDateTime || 0))
+          .slice(0, limit)
+          .map(f => ({
+            id: f.id,
+            name: f.name,
+            webUrl: f.webUrl,
+            lastModified: f.lastModifiedDateTime,
+            size: f.size
+          }));
+        return { content: [{ type: 'text', text: JSON.stringify({ count: keynoteFiles.length, keynotes: keynoteFiles }) }] };
+      }
+      case 'graph_list_presentation_files': {
+        const limit = args.limit || 5;
+        // Search for PPTX and PDF files in parallel
+        const [pptxResult, pdfResult] = await Promise.all([
+          callGraphAPI(`/me/drive/root/search(q='.pptx')?$top=50`),
+          callGraphAPI(`/me/drive/root/search(q='.pdf')?$top=50`)
+        ]);
+        // Sort and limit PPTX files
+        const pptxFiles = pptxResult.value
+          .filter(f => f.name.toLowerCase().endsWith('.pptx'))
+          .sort((a, b) => new Date(b.lastModifiedDateTime || 0) - new Date(a.lastModifiedDateTime || 0))
+          .slice(0, limit)
+          .map(f => ({ id: f.id, name: f.name, webUrl: f.webUrl, lastModified: f.lastModifiedDateTime, size: f.size, type: 'pptx' }));
+        // Sort and limit PDF files
+        const pdfFiles = pdfResult.value
+          .filter(f => f.name.toLowerCase().endsWith('.pdf'))
+          .sort((a, b) => new Date(b.lastModifiedDateTime || 0) - new Date(a.lastModifiedDateTime || 0))
+          .slice(0, limit)
+          .map(f => ({ id: f.id, name: f.name, webUrl: f.webUrl, lastModified: f.lastModifiedDateTime, size: f.size, type: 'pdf' }));
+        return { content: [{ type: 'text', text: JSON.stringify({ pptx: pptxFiles, pdf: pdfFiles }) }] };
+      }
       case 'graph_get_file_info': {
         const file = await callGraphAPI(`/me/drive/items/${args.fileId}`);
         return { content: [{ type: 'text', text: JSON.stringify({ id: file.id, name: file.name, webUrl: file.webUrl, size: file.size, lastModified: file.lastModifiedDateTime, createdBy: file.createdBy?.user?.displayName, mimeType: file.file?.mimeType }) }] };
       }
       case 'graph_get_file_content_url': {
         const file = await callGraphAPI(`/me/drive/items/${args.fileId}`);
-        // Get a sharing link for embedding
-        const shareResult = await callGraphAPI(`/me/drive/items/${args.fileId}/createLink`, {
-          method: 'POST',
-          body: JSON.stringify({ type: 'embed', scope: 'organization' })
-        });
-        return { content: [{ type: 'text', text: JSON.stringify({ id: file.id, name: file.name, downloadUrl: file['@microsoft.graph.downloadUrl'], embedUrl: shareResult.link?.webUrl, webUrl: file.webUrl }) }] };
+        // Return the file's download URL and web URL directly (no sharing link needed)
+        return { content: [{ type: 'text', text: JSON.stringify({ id: file.id, name: file.name, downloadUrl: file['@microsoft.graph.downloadUrl'], webUrl: file.webUrl }) }] };
       }
       default: throw new Error(`Unknown tool: ${name}`);
     }
@@ -381,9 +458,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Express App
 const app = express();
-app.use(cors({ origin: SECURITY.corsOrigins === '*' ? true : SECURITY.corsOrigins.split(','), credentials: true }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(cors({ origin: SECURITY.corsOrigins === '*' ? true : SECURITY.corsOrigins.split(','), credentials: true, exposedHeaders: ['mcp-session-id'] }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Set default Accept headers for MCP endpoints if not provided
 app.use('/mcp', (req, res, next) => {
@@ -398,8 +475,36 @@ app.use((req, res, next) => { metrics.requestCount++; next(); });
 const limiter = rateLimit({ windowMs: SECURITY.defaultRateLimit.windowMs, max: SECURITY.defaultRateLimit.max, message: { error: 'Rate limit exceeded' } });
 app.use('/mcp', limiter);
 
+// Helper to check if request is from local network (for kiosk displays)
+function isLocalRequest(req) {
+  const ip = req.ip || req.connection?.remoteAddress || '';
+  // Check for localhost, IPv4 private ranges, and IPv6 localhost
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' ||
+    /^192\.168\.\d+\.\d+$/.test(ip) || /^::ffff:192\.168\.\d+\.\d+$/.test(ip) ||
+    /^10\.\d+\.\d+\.\d+$/.test(ip) || /^::ffff:10\.\d+\.\d+\.\d+$/.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(ip) ||
+    // Tailscale CGNAT range: 100.64.0.0/10 (100.64.x.x - 100.127.x.x)
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/.test(ip) ||
+    /^::ffff:100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/.test(ip);
+}
+
+// Middleware to restrict access to Tailscale/local network only
+function tailscaleOnlyMiddleware(req, res, next) {
+  if (isLocalRequest(req)) {
+    return next();
+  }
+  logger.warn({ ip: req.ip, path: req.path }, 'Blocked non-Tailscale request to protected route');
+  return res.status(403).send('Access denied. This page is only accessible via Tailscale VPN.');
+}
+
 async function authMiddleware(req, res, next) {
   if (!SECURITY.requireApiKey && !SECURITY.oauth.enabled) return next();
+
+  // Skip auth for local network requests (kiosk displays)
+  if (isLocalRequest(req)) {
+    req.auth = { type: 'local', tier: 'basic' };
+    return next();
+  }
 
   // Check for OAuth Bearer token first
   const authHeader = req.headers['authorization'];
@@ -630,6 +735,49 @@ app.post('/oauth/token', (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ status: isConnected && isIdentified ? 'healthy' : 'degraded', websocket: { connected: isConnected, identified: isIdentified }, components: Object.keys(discoveredComponents.list).length, uptime: Math.floor((Date.now() - metrics.startTime) / 1000) }));
+
+// Device login redirect - creates a form that POSTs to Microsoft with the code pre-filled
+app.get('/auth/devicelogin', (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.redirect('https://microsoft.com/devicelogin');
+  }
+  // Serve a page that auto-submits a POST form to Microsoft deviceauth
+  res.type('html').send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Signing in...</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f5f5; }
+    .loader { text-align: center; }
+    .spinner { width: 40px; height: 40px; border: 3px solid #e0e0e0; border-top: 3px solid #0078d4; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="loader">
+    <div class="spinner"></div>
+    <p>Redirecting to Microsoft...</p>
+  </div>
+  <form id="f" method="POST" action="https://login.microsoftonline.com/common/oauth2/deviceauth">
+    <input type="hidden" name="otc" value="${code.replace(/[^A-Z0-9]/gi, '')}">
+  </form>
+  <script>document.getElementById('f').submit();</script>
+</body>
+</html>`);
+});
+
+// Serve the Voice Assistant Orb HTML (Tailscale/local only)
+app.get('/orb', tailscaleOnlyMiddleware, (req, res) => {
+  try {
+    const orbPath = join(__dirname, '..', '..', 'tools', 'bucontrolVoiceAssistantOrb.html');
+    const html = readFileSync(orbPath, 'utf8');
+    res.type('html').send(html);
+  } catch (error) {
+    logger.error({ error: error.message }, 'Failed to serve orb HTML');
+    res.status(500).send('Failed to load orb interface');
+  }
+});
 app.get('/ready', (req, res) => isConnected && isIdentified ? res.json({ ready: true }) : res.status(503).json({ ready: false }));
 app.get('/live', (req, res) => res.json({ alive: true }));
 
@@ -673,11 +821,15 @@ app.post('/auth/microsoft', (req, res) => {
 
   logger.info({ user: user?.displayName }, 'Microsoft Graph token received');
 
+  // Persist token to file for server restarts
+  savePersistedToken();
+
   res.json({ success: true, user: user?.displayName });
 });
 
 // Get current Microsoft auth status
-app.get('/auth/microsoft', authMiddleware, (req, res) => {
+// No auth required - kiosks need to check status
+app.get('/auth/microsoft', (req, res) => {
   if (!msGraphTokens.current) {
     return res.json({ authenticated: false });
   }
@@ -722,7 +874,12 @@ app.post('/auth/microsoft/devicecode', async (req, res) => {
       return res.status(response.status).json(data);
     }
 
-    logger.info({ user_code: data.user_code }, 'Device code issued');
+    logger.info({
+      user_code: data.user_code,
+      has_complete_uri: !!data.verification_uri_complete,
+      verification_uri: data.verification_uri,
+      verification_uri_complete: data.verification_uri_complete
+    }, 'Device code issued');
     res.json(data);
   } catch (error) {
     logger.error({ error: error.message }, 'Device code proxy error');
@@ -794,6 +951,63 @@ async function callGraphAPI(endpoint, options = {}) {
 
   return response.json();
 }
+
+// File download proxy - streams files through server with proper auth
+app.get('/files/:fileId/download', async (req, res) => {
+  const { fileId } = req.params;
+
+  if (!msGraphTokens.current?.accessToken) {
+    return res.status(401).json({ error: 'Not authenticated with Microsoft' });
+  }
+
+  try {
+    // First get file metadata to get the name and mime type
+    const metadata = await callGraphAPI(`/me/drive/items/${fileId}`);
+    const fileName = metadata.name || 'download';
+    const mimeType = metadata.file?.mimeType || 'application/octet-stream';
+
+    // Get file content
+    const contentUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${fileId}/content`;
+    const response = await fetch(contentUrl, {
+      headers: {
+        'Authorization': `Bearer ${msGraphTokens.current.accessToken}`
+      },
+      redirect: 'follow'
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to download file: ${response.status}`);
+    }
+
+    // Set headers for file download
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileName)}"`);
+    if (metadata.size) {
+      res.setHeader('Content-Length', metadata.size);
+    }
+
+    // Convert Web ReadableStream to Node.js Readable stream
+    const nodeStream = Readable.fromWeb(response.body);
+
+    // Pipe to response
+    nodeStream.pipe(res);
+
+    // Handle stream completion
+    nodeStream.on('end', () => {
+      logger.info({ fileId, fileName }, 'File downloaded via proxy');
+    });
+
+    nodeStream.on('error', (err) => {
+      logger.error({ error: err.message, fileId }, 'Stream error during file download');
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Download failed' });
+      }
+    });
+  } catch (error) {
+    logger.error({ error: error.message, fileId }, 'File download proxy error');
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Streamable HTTP transport - session management
 const transports = new Map();
@@ -878,6 +1092,24 @@ async function main() {
   const httpServer = app.listen(CONFIG.httpPort, CONFIG.bindAddress, () => {
     logger.info({ address: `${CONFIG.bindAddress}:${CONFIG.httpPort}` }, 'HTTP server listening');
   });
+
+  // Start HTTPS server for local network access (uses same certs as MJPEG proxy)
+  const SSL_CERT_PATH = join(__dirname, '..', '..', 'server', 'certs', 'server.cert');
+  const SSL_KEY_PATH = join(__dirname, '..', '..', 'server', 'certs', 'server.key');
+
+  if (existsSync(SSL_CERT_PATH) && existsSync(SSL_KEY_PATH)) {
+    const httpsPort = parseInt(process.env.HTTPS_PORT || '3101');
+    const httpsServer = https.createServer({
+      cert: readFileSync(SSL_CERT_PATH),
+      key: readFileSync(SSL_KEY_PATH)
+    }, app);
+
+    httpsServer.listen(httpsPort, CONFIG.bindAddress, () => {
+      logger.info({ address: `${CONFIG.bindAddress}:${httpsPort}` }, 'HTTPS server listening');
+    });
+  } else {
+    logger.warn('SSL certificates not found, HTTPS server not started');
+  }
 
   // Connect to WebSocket in background with retry logic
   async function connectWithRetry(maxRetries = 10) {

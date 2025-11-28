@@ -20,6 +20,7 @@ import { fileURLToPath } from 'url';
 import http from 'http';
 import https from 'https';
 import { Readable } from 'stream';
+import { exec } from 'child_process';
 import jwt from 'jsonwebtoken';
 import jwksRsa from 'jwks-rsa';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -373,8 +374,49 @@ const metrics = {
   toolErrors: new Map(),
   activeSessions: new Map(),
   totalSessions: 0,
-  rateLimitHits: 0
+  rateLimitHits: 0,
+  // Tailscale status cache (updated periodically)
+  tailscale: {
+    enabled: !!process.env.TAILSCALE_AUTHKEY,
+    online: false,
+    peerCount: 0,
+    lastCheck: null,
+    consecutiveFailures: 0
+  }
 };
+
+// Periodic Tailscale status check (every 30 seconds)
+function updateTailscaleStatus() {
+  if (!metrics.tailscale.enabled) return;
+
+  exec('tailscale status --json 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
+    metrics.tailscale.lastCheck = Date.now();
+    if (err) {
+      metrics.tailscale.online = false;
+      metrics.tailscale.consecutiveFailures++;
+      if (metrics.tailscale.consecutiveFailures > 3) {
+        logger.warn({ failures: metrics.tailscale.consecutiveFailures }, 'Tailscale health check failing');
+      }
+      return;
+    }
+    try {
+      const status = JSON.parse(stdout);
+      metrics.tailscale.online = status.Self?.Online === true;
+      metrics.tailscale.peerCount = status.Peer ? Object.keys(status.Peer).length : 0;
+      metrics.tailscale.consecutiveFailures = 0;
+    } catch (e) {
+      metrics.tailscale.online = false;
+      metrics.tailscale.consecutiveFailures++;
+    }
+  });
+}
+
+// Start periodic Tailscale health check
+if (metrics.tailscale.enabled) {
+  setInterval(updateTailscaleStatus, 30000);
+  // Initial check after short delay to let Tailscale start
+  setTimeout(updateTailscaleStatus, 5000);
+}
 
 // MCP Server
 const server = new Server(
@@ -428,8 +470,8 @@ function isLocalOrTailscaleIP(ip) {
   if (/^10\.\d+\.\d+\.\d+$/.test(cleanIp)) return true;
   if (/^192\.168\.\d+\.\d+$/.test(cleanIp)) return true;
 
-  // All 100.x.x.x IPs (Tailscale uses CGNAT range 100.64-127, but be permissive)
-  if (/^100\.\d+\.\d+\.\d+$/.test(cleanIp)) return true;
+  // Tailscale CGNAT range: 100.64.0.0/10 (100.64.x.x - 100.127.x.x)
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/.test(cleanIp)) return true;
 
   return false;
 }
@@ -467,8 +509,8 @@ app.use(cors({
   credentials: true,
   exposedHeaders: ['mcp-session-id']
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use((req, res, next) => { metrics.requestCount++; next(); });
 
 // Apply Tailscale-only restriction to all routes
@@ -576,6 +618,42 @@ app.get('/ready', (req, res) => wsManager.isConnected && wsManager.isIdentified
   : res.status(503).json({ ready: false }));
 app.get('/live', (req, res) => res.json({ alive: true }));
 
+// Tailscale health endpoint - detailed Tailscale connection status
+app.get('/health/tailscale', (req, res) => {
+  // Check if Tailscale is available (only in container/deployed environment)
+  exec('tailscale status --json 2>/dev/null', { timeout: 5000 }, (err, stdout, stderr) => {
+    if (err) {
+      // Tailscale not available - this is expected in development
+      return res.json({
+        available: false,
+        reason: process.env.TAILSCALE_AUTHKEY ? 'tailscale_not_running' : 'no_authkey_configured',
+        environment: process.env.NODE_ENV || 'production'
+      });
+    }
+    try {
+      const status = JSON.parse(stdout);
+      const selfIP = status.Self?.TailscaleIPs?.[0] || null;
+      const peers = status.Peer ? Object.keys(status.Peer).length : 0;
+      const derpRegion = status.Self?.Relay || null;
+
+      res.json({
+        available: true,
+        healthy: status.Self?.Online === true,
+        ip: selfIP,
+        hostname: status.Self?.HostName || null,
+        online: status.Self?.Online || false,
+        relay: derpRegion,
+        peerCount: peers,
+        version: status.Version || null,
+        health: status.Health || [],
+        socksProxy: process.env.TAILSCALE_SOCKS_PORT ? `localhost:${process.env.TAILSCALE_SOCKS_PORT}` : 'localhost:1055'
+      });
+    } catch (parseErr) {
+      res.status(500).json({ error: 'Failed to parse Tailscale status', details: parseErr.message });
+    }
+  });
+});
+
 // Debug endpoint - expose raw state for troubleshooting
 app.get('/debug/state', authMiddleware, async (req, res) => {
   try {
@@ -607,6 +685,14 @@ mcp_components_discovered ${Object.keys(wsManager.discoveredComponents.list).len
 mcp_sessions_active ${sessionManager.sessions.size}
 # HELP mcp_uptime_seconds Uptime
 mcp_uptime_seconds ${Math.floor((Date.now() - metrics.startTime) / 1000)}
+# HELP tailscale_enabled Tailscale is configured
+tailscale_enabled ${metrics.tailscale.enabled ? 1 : 0}
+# HELP tailscale_online Tailscale connection is online
+tailscale_online ${metrics.tailscale.online ? 1 : 0}
+# HELP tailscale_peers Number of Tailscale peers
+tailscale_peers ${metrics.tailscale.peerCount}
+# HELP tailscale_consecutive_failures Consecutive health check failures
+tailscale_consecutive_failures ${metrics.tailscale.consecutiveFailures}
 ${toolCallsStr}`);
 });
 
@@ -748,8 +834,8 @@ app.post('/oauth/token', (req, res) => {
   return res.status(400).json({ error: 'unsupported_grant_type', error_description: 'Supported: authorization_code, client_credentials' });
 });
 
-// Voice Assistant Orb UI endpoint
-app.get('/orb', (req, res) => {
+// Voice Assistant Orb UI endpoint (Tailscale/local only)
+app.get('/orb', tailscaleOnlyMiddleware, (req, res) => {
   try {
     const orbPath = join(__dirname, '..', '..', 'tools', 'bucontrolVoiceAssistantOrb.html');
     const html = readFileSync(orbPath, 'utf8');
